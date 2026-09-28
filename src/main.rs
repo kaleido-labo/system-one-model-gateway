@@ -1,4 +1,4 @@
-use std::io::BufRead;
+use std::io::{BufRead, IsTerminal};
 use std::path::PathBuf;
 
 use anyhow::{Context, ensure};
@@ -120,7 +120,10 @@ fn hash_stdin_key() -> anyhow::Result<()> {
 
 fn init_logging(format: LogFormat) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let logs = tracing_subscriber::fmt().with_env_filter(filter);
+    // Colours only on a terminal: in a container log they are noise.
+    let logs = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(std::io::stdout().is_terminal());
     match format {
         LogFormat::Json => logs.json().flatten_event(true).init(),
         LogFormat::Text => logs.init(),

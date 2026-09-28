@@ -164,6 +164,9 @@ impl Dispatcher {
             live.push(member);
         }
         if live.is_empty() {
+            // Nobody is left to answer: hand the request slot this batch
+            // booked back to the others.
+            self.pacer.adjust(-1);
             return;
         }
 
@@ -180,11 +183,6 @@ impl Dispatcher {
             plan.standalone_tokens.saturating_sub(plan.estimated_tokens),
         ));
 
-        let start = self
-            .token_pacer
-            .book(Instant::now(), u64::from(plan.estimated_tokens));
-        sleep_until(start).await;
-
         // Serve the most patient caller: callers whose deadline passes first
         // get their 504 from the HTTP handler, the others still get answers.
         let deadline = live
@@ -192,6 +190,25 @@ impl Dispatcher {
             .map(|m| m.deadline)
             .max()
             .expect("at least one live member");
+
+        let estimated = u64::from(plan.estimated_tokens);
+        let start = self.token_pacer.book(Instant::now(), estimated);
+        if start >= deadline {
+            // The tokens-per-second budget is spent past every caller's
+            // deadline. A 429 lets the callers' SDKs come back when it refills.
+            self.token_pacer.adjust(-i64::from(plan.estimated_tokens));
+            self.pacer.adjust(-1);
+            let outcome = Outcome::Failed(GatewayError::rate_limited(
+                "the shared tokens_per_second budget is spent for now",
+                start.saturating_duration_since(Instant::now()),
+            ));
+            for member in live {
+                let _ = member.reply.send(outcome.clone());
+            }
+            return;
+        }
+        sleep_until(start).await;
+
         let sent = Instant::now();
         let result = self.upstream.systemone(plan.body.clone(), deadline).await;
         drop(permit);

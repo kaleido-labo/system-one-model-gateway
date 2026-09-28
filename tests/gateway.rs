@@ -523,3 +523,34 @@ async fn shutdown_lets_in_flight_calls_finish() {
     assert_eq!(finished.status, 200, "{}", finished.text);
     assert_eq!(finished.body["answers"]["q"]["echo"], "Still there?");
 }
+
+#[tokio::test]
+async fn a_spent_tokens_per_second_budget_sheds_with_429() {
+    // Ten tokens per second: the first call (~45 estimated tokens) overdraws
+    // the bucket for about three seconds, past the next call's 1 s deadline.
+    let h = Harness::start(Setup {
+        server: "request_timeout_ms = 1000",
+        upstream: "tokens_per_second = 10\nmax_queue_wait_ms = 500",
+        coalescing: "window_ms = 10",
+        ..Setup::default()
+    })
+    .await;
+    let first = h
+        .call("key-ocr", call_body(receipt(), json!({"a": noul("A?")})))
+        .await;
+    assert_eq!(first.status, 200, "{}", first.text);
+    let second = h
+        .call(
+            "key-fraud",
+            call_body(json!("another receipt"), json!({"b": noul("B?")})),
+        )
+        .await;
+    assert_eq!(second.status, 429, "{}", second.text);
+    assert!(
+        second.body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("tokens_per_second")
+    );
+    assert_eq!(h.mock.state.calls(), 1);
+}
