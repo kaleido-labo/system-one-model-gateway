@@ -36,8 +36,8 @@ Jev bills input tokens only, and the state is usually the bulk of them.
    join a merged call.
 2. Calls with the same model, the same state and the same other top-level
    fields go into one batch. The batch stays open for `window_ms` (10 ms by
-   default) and for as long as it waits for an upstream slot, so merging does
-   the most when traffic is heaviest. In the merged request, question ids
+   default) and for as long as it waits for upstream capacity, so merging
+   does the most when traffic is heaviest. In the merged request, question ids
    become `q0`, `q1` and so on, and a question asked by two services is sent
    once. The same state sent with different whitespace still merges. The same
    keys in a different order do not, because the model reads the state as
@@ -50,17 +50,21 @@ Jev bills input tokens only, and the state is usually the bulk of them.
    per second. It retries failed attempts with exponential backoff on 429,
    529, 5xx and network errors, and follows `retry-after-ms` or `retry-after`
    when TypeSafe sends one. A 429 pauses all batches at once instead of
-   letting each one find the limit by itself. If TypeSafe rejects a merged
+   letting each one find the limit by itself. When the pause ends, the
+   batches leave one slot apart. If TypeSafe rejects a merged
    request (400 or 422), the gateway replays each caller alone, so the error
    reaches only the caller whose question caused it.
 4. Each service gets TypeSafe's answers under its own question ids. The merged
    call's `usage` is split between callers: the state evenly, each question to
    whoever asked it. The shares add up to exactly what TypeSafe billed.
 
-When waiting for a slot would take longer than `max_queue_wait_ms`, the
-gateway answers 429 with `retry-after` right away. The TypeSafe SDKs retry
-429s and honour that header, so the service backs off without any code of
-its own.
+A call waits at most `max_queue_wait_ms` for upstream capacity (a request
+slot, a free connection, the token budget), on top of the merge window. When
+the gateway can tell up front that the wait will be longer, it answers 429
+with `retry-after` straight away. When it only finds out while the call
+waits, the 429 goes out as soon as the limit passes. In both cases the call
+is refused rather than sent late. The TypeSafe SDKs retry 429s and honour
+that header, so the service backs off without any code of its own.
 
 ## Pointing a service at the gateway
 
@@ -135,7 +139,7 @@ The TypeSafe key comes from the variable named by `upstream.api_key_env`
 | `upstream.requests_per_minute`, `burst`, `tokens_per_second` | `1200`, one second's worth, `250000` | The account's limits, shared by all services |
 | `upstream.max_concurrency` | `64` | Upstream calls in flight |
 | `upstream.max_retries`, `backoff_*_ms`, `attempt_timeout_ms` | `3`, `200` to `3000`, `5000` | Retry policy |
-| `upstream.max_queue_wait_ms` | `2000` | Past this wait, answer 429 with a retry-after |
+| `upstream.max_queue_wait_ms` | `2000` | Longest wait for upstream capacity on top of the merge window; past it, a 429 with a retry-after |
 | `coalescing.window_ms` | `10` | How long a batch waits for company; `0` turns merging off |
 | `coalescing.max_questions`, `max_request_tokens`, `max_state_plus_question_tokens` | `128`, `56000`, `28000` | What one merged call may carry; kept under the vendor's 64k and 32k |
 | `[[service]] key_sha256` | required | One or more key hashes; two let you rotate a key without downtime |
