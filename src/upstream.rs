@@ -154,15 +154,23 @@ impl Upstream {
         let mut attempt = 0;
         let mut last_failure = None;
         let result = loop {
-            if let Some(resume) = self.pacer.resume_at(Instant::now()) {
-                if resume >= deadline {
+            let now = Instant::now();
+            if self.pacer.resume_at(now).is_some() {
+                // This attempt's slot fell inside a pause TypeSafe asked for.
+                // Waking up at the end of the pause would send every held
+                // batch at the same instant, so take a fresh slot after it,
+                // spaced like any other booking, then look again in case the
+                // pause got longer meanwhile.
+                let slot = self.pacer.book(now, 1);
+                if slot >= deadline {
+                    self.pacer.adjust(-1);
                     break Err(last_failure.unwrap_or(UpstreamFailure::Paused {
-                        retry_after: resume.saturating_duration_since(Instant::now()),
+                        retry_after: slot.saturating_duration_since(now),
                     }));
                 }
-                sleep_until(resume).await;
+                sleep_until(slot).await;
+                continue;
             }
-            let now = Instant::now();
             let remaining = deadline.saturating_duration_since(now);
             if remaining < Duration::from_millis(1) {
                 break Err(last_failure.unwrap_or(UpstreamFailure::Deadline));
@@ -314,17 +322,19 @@ pub fn parse_retry_after(headers: &HeaderMap, now: SystemTime) -> Option<Duratio
             .and_then(|value| value.to_str().ok())
             .map(str::trim)
     };
+    // Capped before the conversion: `Duration::from_secs_f64` panics on
+    // values that overflow it, and a header is no reason to crash.
+    let seconds = |seconds: f64| {
+        (seconds.is_finite() && seconds >= 0.0)
+            .then(|| Duration::from_secs_f64(seconds.min(MAX_RETRY_AFTER.as_secs_f64())))
+    };
     let from_ms = header(RETRY_AFTER_MS)
         .and_then(|ms| ms.parse::<f64>().ok())
-        .filter(|ms| ms.is_finite() && *ms >= 0.0)
-        .map(|ms| Duration::from_secs_f64(ms / 1000.0));
+        .and_then(|ms| seconds(ms / 1000.0));
     let delay = from_ms.or_else(|| {
         let value = header(RETRY_AFTER)?;
         match value.parse::<f64>() {
-            Ok(seconds) if seconds.is_finite() && seconds >= 0.0 => {
-                Some(Duration::from_secs_f64(seconds))
-            }
-            Ok(_) => None,
+            Ok(parsed) => seconds(parsed),
             Err(_) => httpdate::parse_http_date(value)
                 .ok()
                 .map(|at| at.duration_since(now).unwrap_or_default()),
@@ -410,6 +420,15 @@ mod tests {
         let now = SystemTime::now();
         assert_eq!(
             parse_retry_after(&headers(&[("retry-after", "86400")]), now),
+            Some(MAX_RETRY_AFTER)
+        );
+        // Values that would overflow a Duration are capped, not a panic.
+        assert_eq!(
+            parse_retry_after(&headers(&[("retry-after", "100000000000000000000")]), now),
+            Some(MAX_RETRY_AFTER)
+        );
+        assert_eq!(
+            parse_retry_after(&headers(&[("retry-after-ms", "1e300")]), now),
             Some(MAX_RETRY_AFTER)
         );
         assert_eq!(

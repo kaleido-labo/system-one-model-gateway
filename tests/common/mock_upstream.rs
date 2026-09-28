@@ -50,6 +50,8 @@ pub struct MockState {
     api_key: String,
     /// Bodies of every `POST /v1/systemone`, as received.
     received: Mutex<Vec<String>>,
+    /// When each of them arrived.
+    arrivals: Mutex<Vec<std::time::Instant>>,
     script: Mutex<VecDeque<Scripted>>,
     delay: Mutex<Duration>,
     models_calls: AtomicUsize,
@@ -58,6 +60,11 @@ pub struct MockState {
 impl MockState {
     pub fn calls(&self) -> usize {
         self.received.lock().unwrap().len()
+    }
+
+    /// Arrival time of every `POST /v1/systemone`, oldest first.
+    pub fn arrivals(&self) -> Vec<std::time::Instant> {
+        self.arrivals.lock().unwrap().clone()
     }
 
     /// The `usage.input_tokens` the mock billed for a received body.
@@ -99,6 +106,7 @@ impl MockUpstream {
         let state = Arc::new(MockState {
             api_key: api_key.to_owned(),
             received: Mutex::new(Vec::new()),
+            arrivals: Mutex::new(Vec::new()),
             script: Mutex::new(VecDeque::new()),
             delay: Mutex::new(Duration::ZERO),
             models_calls: AtomicUsize::new(0),
@@ -152,6 +160,11 @@ async fn systemone(
     let call = {
         let mut received = state.received.lock().unwrap();
         received.push(text.clone());
+        state
+            .arrivals
+            .lock()
+            .unwrap()
+            .push(std::time::Instant::now());
         received.len()
     };
     if !authorized(&state, &headers) {

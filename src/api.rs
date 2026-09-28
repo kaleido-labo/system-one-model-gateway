@@ -20,7 +20,7 @@ use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::{Level, Span};
 
 use crate::coalescer::{Coalescer, Saturated};
-use crate::dispatch::{Member, Outcome};
+use crate::dispatch::Outcome;
 use crate::error::{GatewayError, insert_retry_after};
 use crate::metrics::{CallLabels, Metrics};
 use crate::protocol::{PreparedRequest, RequestError};
@@ -159,13 +159,9 @@ async fn handle_systemone(
     let questions = request.questions.len() as u64;
     let deadline = arrived + state.request_timeout;
     let (reply, answer) = oneshot::channel();
-    let member = Member {
-        request,
-        queue_deadline: arrived + state.max_queue_wait,
-        deadline,
-        reply,
-    };
-    if let Err(Saturated { retry_after }) = state.coalescer.submit(member) {
+    if let Err(Saturated { retry_after }) =
+        state.coalescer.submit(request, arrived, deadline, reply)
+    {
         return GatewayError::rate_limited(
             "the shared TypeSafe quota is booked beyond max_queue_wait_ms; retry later",
             retry_after,

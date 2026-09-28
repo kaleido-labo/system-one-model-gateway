@@ -26,7 +26,8 @@ attempt_timeout_ms = 5000
 max_retries = 3
 backoff_initial_ms = 200
 backoff_max_ms = 3000
-max_queue_wait_ms = 2000       # past this, callers get 429 + retry-after
+max_queue_wait_ms = 2000       # wait for capacity allowed on top of the merge window;
+                               # past it, callers get 429 + retry-after
 models_cache_ttl_ms = 300000
 
 [coalescing]

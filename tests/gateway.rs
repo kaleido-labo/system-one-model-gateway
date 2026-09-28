@@ -527,18 +527,23 @@ async fn shutdown_lets_in_flight_calls_finish() {
 #[tokio::test]
 async fn a_spent_tokens_per_second_budget_sheds_with_429() {
     // Ten tokens per second: the first call (~45 estimated tokens) overdraws
-    // the bucket for about three seconds, past the next call's 1 s deadline.
+    // the bucket for about 3.7 s. TypeSafe takes 1.5 s to answer it, so the
+    // next call would wait about 2.2 s: inside its 3.5 s deadline, far past
+    // its 500 ms queue wait.
     let h = Harness::start(Setup {
-        server: "request_timeout_ms = 1000",
+        server: "request_timeout_ms = 3500",
         upstream: "tokens_per_second = 10\nmax_queue_wait_ms = 500",
         coalescing: "window_ms = 10",
         ..Setup::default()
     })
     .await;
+    h.mock.state.set_delay(Duration::from_millis(1_500));
     let first = h
         .call("key-ocr", call_body(receipt(), json!({"a": noul("A?")})))
         .await;
     assert_eq!(first.status, 200, "{}", first.text);
+    h.mock.state.set_delay(Duration::ZERO);
+    let sent = Instant::now();
     let second = h
         .call(
             "key-fraud",
@@ -546,11 +551,14 @@ async fn a_spent_tokens_per_second_budget_sheds_with_429() {
         )
         .await;
     assert_eq!(second.status, 429, "{}", second.text);
+    let message = second.body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("tokens_per_second"), "{message}");
+    // Refused as soon as the budget shows it cannot go in time, instead of
+    // being held until its deadline and sent anyway.
     assert!(
-        second.body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("tokens_per_second")
+        sent.elapsed() < Duration::from_millis(300),
+        "answered after {:?}",
+        sent.elapsed()
     );
     assert_eq!(h.mock.state.calls(), 1);
 }
@@ -558,7 +566,7 @@ async fn a_spent_tokens_per_second_budget_sheds_with_429() {
 #[tokio::test]
 async fn a_call_stuck_behind_busy_upstream_slots_gets_429_instead_of_a_late_send() {
     // One upstream call at a time, and TypeSafe takes a second to answer: the
-    // second call's queue deadline passes while it waits for the only slot.
+    // second call runs out of patience while it waits for the only connection.
     let h = Harness::start(Setup {
         server: "request_timeout_ms = 5000",
         upstream: "max_concurrency = 1\nmax_queue_wait_ms = 300",
@@ -567,7 +575,74 @@ async fn a_call_stuck_behind_busy_upstream_slots_gets_429_instead_of_a_late_send
     })
     .await;
     h.mock.state.set_delay(Duration::from_secs(1));
-    let (first, second) = tokio::join!(
+    let (first, (second, waited)) = tokio::join!(
+        h.call(
+            "key-ocr",
+            call_body(json!("receipt A"), json!({"a": noul("A?")}))
+        ),
+        async {
+            sleep(Duration::from_millis(50)).await;
+            let sent = Instant::now();
+            let reply = h
+                .call(
+                    "key-fraud",
+                    call_body(json!("receipt B"), json!({"b": noul("B?")})),
+                )
+                .await;
+            (reply, sent.elapsed())
+        },
+    );
+    assert_eq!(first.status, 200, "{}", first.text);
+    assert_eq!(second.status, 429, "{}", second.text);
+    assert!(second.header("retry-after-ms").parse::<u64>().unwrap() >= 500);
+    // The 429 comes when the caller's 300 ms run out, not when the busy
+    // connection frees up a second later.
+    assert!(
+        waited < Duration::from_millis(700),
+        "answered after {waited:?}"
+    );
+    assert_eq!(h.mock.state.calls(), 1);
+}
+
+#[tokio::test]
+async fn a_zero_queue_wait_still_serves_an_idle_gateway() {
+    // The merge window is the gateway's own delay and must not count against
+    // a caller that accepts no queueing at all.
+    let h = Harness::start(Setup {
+        upstream: "max_queue_wait_ms = 0",
+        coalescing: "window_ms = 10",
+        ..Setup::default()
+    })
+    .await;
+    for n in 0..3 {
+        let reply = h
+            .call(
+                "key-ocr",
+                call_body(json!(format!("receipt {n}")), json!({"q": noul("?")})),
+            )
+            .await;
+        assert_eq!(reply.status, 200, "{}", reply.text);
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(h.mock.state.calls(), 3);
+}
+
+#[tokio::test]
+async fn batches_held_by_a_429_pause_leave_spaced_out() {
+    // Two requests per second. TypeSafe takes 300 ms to answer, so the other
+    // two batches book their slots (at 0.5 s and 1 s) before the 429 asking
+    // for 1.5 s comes back. They must not all fire the moment the pause ends.
+    let h = Harness::start(Setup {
+        upstream: "requests_per_minute = 120\nburst = 1\nmax_queue_wait_ms = 2500",
+        coalescing: "window_ms = 10",
+        ..Setup::default()
+    })
+    .await;
+    h.mock.state.set_delay(Duration::from_millis(300));
+    h.mock.state.push(
+        Scripted::status(429, r#"{"detail":"Too Many Requests"}"#).header("retry-after-ms", "1500"),
+    );
+    let (a, b, c) = tokio::join!(
         h.call(
             "key-ocr",
             call_body(json!("receipt A"), json!({"a": noul("A?")}))
@@ -580,9 +655,41 @@ async fn a_call_stuck_behind_busy_upstream_slots_gets_429_instead_of_a_late_send
             )
             .await
         },
+        async {
+            sleep(Duration::from_millis(100)).await;
+            h.call(
+                "key-expense",
+                call_body(json!("receipt C"), json!({"c": noul("C?")})),
+            )
+            .await
+        },
     );
-    assert_eq!(first.status, 200, "{}", first.text);
-    assert_eq!(second.status, 429, "{}", second.text);
-    assert!(second.header("retry-after-ms").parse::<u64>().unwrap() >= 500);
-    assert_eq!(h.mock.state.calls(), 1);
+    for reply in [&a, &b, &c] {
+        assert_eq!(reply.status, 200, "{}", reply.text);
+    }
+    // The 429, then three calls after the pause, half a second apart.
+    let arrivals = h.mock.state.arrivals();
+    assert_eq!(arrivals.len(), 4);
+    assert!(arrivals[1].duration_since(arrivals[0]) >= Duration::from_millis(1_400));
+    for pair in arrivals[1..].windows(2) {
+        let gap = pair[1].duration_since(pair[0]);
+        assert!(
+            gap >= Duration::from_millis(400),
+            "calls {gap:?} apart after the pause"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_vendor_403_reaches_the_caller_as_is() {
+    // Unlike a 401, a 403 says something about what was asked, such as a
+    // model the account may not use, so the caller needs to see it.
+    let h = Harness::start(Setup::default()).await;
+    let denied = r#"{"detail":"model not available on this plan"}"#;
+    h.mock.state.push(Scripted::status(403, denied));
+    let reply = h
+        .call("key-ocr", call_body(receipt(), json!({"q": noul("?")})))
+        .await;
+    assert_eq!(reply.status, 403);
+    assert_eq!(reply.text, denied);
 }

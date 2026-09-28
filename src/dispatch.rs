@@ -8,7 +8,7 @@ use std::time::Duration;
 use axum::http::StatusCode;
 use bytes::Bytes;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
-use tokio::time::{Instant, sleep_until};
+use tokio::time::{Instant, sleep_until, timeout_at};
 use tracing::{debug, error, warn};
 
 use crate::batch::{Plan, SplitError};
@@ -19,7 +19,7 @@ use crate::protocol::{PreparedRequest, input_tokens};
 use crate::upstream::{Upstream, UpstreamFailure, describe};
 
 /// Shortest retry-after the gateway suggests when it sheds a call.
-const MIN_RETRY_AFTER: Duration = Duration::from_millis(500);
+pub const MIN_RETRY_AFTER: Duration = Duration::from_millis(500);
 
 type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
@@ -27,8 +27,9 @@ type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 pub struct Member {
     pub request: PreparedRequest,
     /// Latest instant the call may still leave for TypeSafe. Past it, the
-    /// caller is better served by a 429 and a retry-after than by a late send.
-    pub queue_deadline: Instant,
+    /// caller is better served by a 429 and a retry-after than by a late send
+    /// that burns tokens on an answer it may no longer wait for.
+    pub latest_send: Instant,
     /// When the caller stops waiting for an answer.
     pub deadline: Instant,
     pub reply: oneshot::Sender<Outcome>,
@@ -57,9 +58,7 @@ pub enum Outcome {
 impl Outcome {
     pub fn from_failure(failure: &UpstreamFailure) -> Self {
         match failure {
-            UpstreamFailure::Status { status, .. }
-                if matches!(*status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) =>
-            {
+            UpstreamFailure::Status { status, .. } if *status == StatusCode::UNAUTHORIZED => {
                 // The caller's key was fine; the gateway's own key is not.
                 // Passing the 401 through would send the service chasing a
                 // problem it does not have.
@@ -144,36 +143,75 @@ impl Dispatcher {
         permit: OwnedSemaphorePermit,
         opened: Instant,
     ) {
-        let now = Instant::now();
-        let mut live = Vec::with_capacity(members.len());
-        for member in members {
-            if member.reply.is_closed() {
-                // The caller timed out or hung up; don't pay for its questions.
-                continue;
-            }
-            if now > member.queue_deadline {
-                let retry_after = self.pacer.backlog(now).max(MIN_RETRY_AFTER);
-                let _ = member
-                    .reply
-                    .send(Outcome::Failed(GatewayError::rate_limited(
-                        "every upstream slot stayed busy past max_queue_wait_ms",
-                        retry_after,
-                    )));
-                continue;
-            }
-            live.push(member);
-        }
+        // Callers who timed out or hung up are not worth paying for. Callers
+        // whose latest send time passed were answered while the batch waited
+        // for a connection.
+        let mut live: Vec<Member> = members
+            .into_iter()
+            .filter(|member| !member.reply.is_closed())
+            .collect();
         if live.is_empty() {
             // Nobody is left to answer: hand the request slot this batch
             // booked back to the others.
             self.pacer.adjust(-1);
             return;
         }
+        let mut plan = Plan::new(&live.iter().map(|m| &m.request).collect::<Vec<_>>());
 
-        let plan = Plan::new(&live.iter().map(|m| &m.request).collect::<Vec<_>>());
-        self.metrics
-            .queue_wait
-            .observe(now.saturating_duration_since(opened).as_secs_f64());
+        // Tokens per second, booked on the estimate and corrected with the
+        // real count once TypeSafe answers. The batch waits for the budget
+        // only as long as its most patient caller allows.
+        let now = Instant::now();
+        let most_patient = live
+            .iter()
+            .map(|m| m.latest_send)
+            .max()
+            .expect("at least one live member");
+        let start = match self.token_pacer.try_book(
+            now,
+            u64::from(plan.estimated_tokens),
+            most_patient.saturating_duration_since(now),
+        ) {
+            Ok(start) => start,
+            Err(wait) => {
+                self.pacer.adjust(-1);
+                let outcome = Outcome::Failed(GatewayError::rate_limited(
+                    "the shared tokens_per_second budget is spent for now",
+                    wait.max(MIN_RETRY_AFTER),
+                ));
+                for member in live {
+                    let _ = member.reply.send(outcome.clone());
+                }
+                return;
+            }
+        };
+        if start > now {
+            // Callers who cannot wait until `start` get their 429 now, and
+            // the others go without them.
+            let (patient, impatient): (Vec<_>, Vec<_>) =
+                live.into_iter().partition(|m| m.latest_send >= start);
+            if !impatient.is_empty() {
+                let outcome = Outcome::Failed(GatewayError::rate_limited(
+                    "the shared tokens_per_second budget is spent for now",
+                    start.saturating_duration_since(now).max(MIN_RETRY_AFTER),
+                ));
+                for member in impatient {
+                    let _ = member.reply.send(outcome.clone());
+                }
+                let smaller = Plan::new(&patient.iter().map(|m| &m.request).collect::<Vec<_>>());
+                self.token_pacer
+                    .adjust(i64::from(smaller.estimated_tokens) - i64::from(plan.estimated_tokens));
+                plan = smaller;
+            }
+            live = patient;
+            sleep_until(start).await;
+        }
+
+        self.metrics.queue_wait.observe(
+            Instant::now()
+                .saturating_duration_since(opened)
+                .as_secs_f64(),
+        );
         self.metrics.batch_callers.observe(plan.callers as f64);
         self.metrics.batch_questions.observe(plan.questions as f64);
         self.metrics
@@ -190,25 +228,6 @@ impl Dispatcher {
             .map(|m| m.deadline)
             .max()
             .expect("at least one live member");
-
-        let estimated = u64::from(plan.estimated_tokens);
-        let start = self.token_pacer.book(Instant::now(), estimated);
-        if start >= deadline {
-            // The tokens-per-second budget is spent past every caller's
-            // deadline. A 429 lets the callers' SDKs come back when it refills.
-            self.token_pacer.adjust(-i64::from(plan.estimated_tokens));
-            self.pacer.adjust(-1);
-            let outcome = Outcome::Failed(GatewayError::rate_limited(
-                "the shared tokens_per_second budget is spent for now",
-                start.saturating_duration_since(Instant::now()),
-            ));
-            for member in live {
-                let _ = member.reply.send(outcome.clone());
-            }
-            return;
-        }
-        sleep_until(start).await;
-
         let sent = Instant::now();
         let result = self.upstream.systemone(plan.body.clone(), deadline).await;
         drop(permit);
@@ -275,12 +294,9 @@ impl Dispatcher {
             Err(failure) => {
                 match &failure {
                     UpstreamFailure::Status { status, .. }
-                        if matches!(*status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) =>
+                        if *status == StatusCode::UNAUTHORIZED =>
                     {
-                        error!(
-                            status = status.as_u16(),
-                            "TypeSafe refused the gateway's API key"
-                        );
+                        error!("TypeSafe refused the gateway's API key");
                     }
                     _ => {
                         warn!(callers = live.len(), failure = %describe(&failure), "TypeSafe call failed")
@@ -298,13 +314,28 @@ impl Dispatcher {
     /// Boxed because it recurses through `dispatch`.
     fn replay_alone(self: Arc<Self>, mut member: Member) -> BoxFuture {
         Box::pin(async move {
-            // The call was admitted already: book a slot however far it is,
-            // and let the caller's own deadline decide.
-            member.queue_deadline = member.deadline;
-            let start = self.pacer.book(Instant::now(), 1);
+            // The call was admitted already, so only its own deadline bounds
+            // the wait for a slot and a connection.
+            member.latest_send = member.deadline;
+            let now = Instant::now();
+            let start = self.pacer.book(now, 1);
+            if start >= member.deadline {
+                self.pacer.adjust(-1);
+                let _ = member
+                    .reply
+                    .send(Outcome::Failed(GatewayError::rate_limited(
+                        "the shared TypeSafe quota is booked past this call's deadline",
+                        start.saturating_duration_since(now),
+                    )));
+                return;
+            }
             sleep_until(start).await;
-            let permit = self.acquire().await;
-            self.dispatch(vec![member], permit, Instant::now()).await;
+            let Ok(permit) = timeout_at(member.deadline, self.acquire()).await else {
+                // The handler has answered 504 by now.
+                self.pacer.adjust(-1);
+                return;
+            };
+            self.dispatch(vec![member], permit, start).await;
         })
     }
 }

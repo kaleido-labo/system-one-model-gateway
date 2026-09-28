@@ -81,8 +81,10 @@ pub struct UpstreamConfig {
     pub max_retries: u32,
     pub backoff_initial_ms: u64,
     pub backoff_max_ms: u64,
-    /// Longest a call may wait for a free upstream slot. Past that, the
-    /// gateway answers 429 with a retry-after and the caller's SDK backs off.
+    /// Longest a call may wait for upstream capacity (a request slot, a free
+    /// connection, the token budget), on top of the merge window. A call that
+    /// would wait longer gets a 429 with a retry-after at that moment, and
+    /// the caller's SDK backs off.
     pub max_queue_wait_ms: u64,
     /// How long `GET /v1/models` is served from memory.
     pub models_cache_ttl_ms: u64,

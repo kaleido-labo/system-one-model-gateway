@@ -1,18 +1,25 @@
 //! Grouping calls that share a state into batches.
 //!
 //! A batch opens with the first call for a `(model, state)` pair and books
-//! one upstream request slot. It stays open for `window_ms`, or for as long
-//! as it waits for that slot, and every call for the same pair that arrives
-//! meanwhile joins it for free. So merging does the most when it matters:
-//! when the upstream limit is saturated and calls queue up anyway.
+//! one upstream request slot. It stays open for `window_ms`, then for as long
+//! as it waits for that slot and for a free upstream connection, and every
+//! call for the same pair that arrives meanwhile joins it for free. So
+//! merging does the most when it matters: when the upstream limit is
+//! saturated and calls queue up anyway.
+//!
+//! Each call carries a latest send time: its arrival plus
+//! `max_queue_wait_ms`, and never earlier than the end of the merge window.
+//! A call still waiting at that time gets a 429 there and then.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use tokio::sync::oneshot;
 use tokio::time::{Instant, sleep_until};
 
-use crate::dispatch::{Dispatcher, Member};
+use crate::dispatch::{Dispatcher, MIN_RETRY_AFTER, Member, Outcome};
+use crate::error::GatewayError;
 use crate::protocol::{BatchKey, PreparedRequest, QuestionKey};
 
 /// What one merged upstream call may carry.
@@ -23,7 +30,7 @@ pub struct BatchLimits {
     pub max_questions: usize,
     pub max_request_tokens: u32,
     pub max_state_plus_question_tokens: u32,
-    /// Longest a new batch may wait for an upstream request slot.
+    /// Longest a call may wait for upstream capacity, on top of the window.
     pub max_queue_wait: Duration,
 }
 
@@ -99,6 +106,25 @@ impl Members {
         }
         self.calls.push(member);
     }
+
+    /// When the next call runs out of patience.
+    fn next_expiry(&self) -> Option<Instant> {
+        self.calls.iter().map(|call| call.latest_send).min()
+    }
+
+    /// Takes out the calls whose latest send time has passed, and recounts
+    /// the totals for the calls that stay.
+    fn take_expired(&mut self, now: Instant) -> Vec<Member> {
+        let (expired, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.calls)
+            .into_iter()
+            .partition(|call| call.latest_send <= now);
+        let mut kept = Members::new(self.state_tokens);
+        for call in waiting {
+            kept.add(call);
+        }
+        *self = kept;
+        expired
+    }
 }
 
 impl Coalescer {
@@ -115,16 +141,31 @@ impl Coalescer {
         self.dispatcher.pacer()
     }
 
-    /// Queues a call. Its outcome arrives on `member.reply`.
-    pub fn submit(self: &Arc<Self>, member: Member) -> Result<(), Saturated> {
+    /// Queues a call that arrived at `arrived`. Its outcome is sent on `reply`.
+    pub fn submit(
+        self: &Arc<Self>,
+        request: PreparedRequest,
+        arrived: Instant,
+        deadline: Instant,
+        reply: oneshot::Sender<Outcome>,
+    ) -> Result<(), Saturated> {
         let now = Instant::now();
-        // Lock order: the open map, then a batch's members. `run` takes them
-        // in the same order.
+        // The merge window is the gateway's own delay: it never counts
+        // against the caller's patience.
+        let latest_send = (arrived + self.limits.max_queue_wait).max(now + self.limits.window);
+        let member = Member {
+            request,
+            latest_send,
+            deadline,
+            reply,
+        };
+        // Lock order: the open map, then a batch's members, then the pacer.
+        // `run` and `shed_expired` take them in the same order.
         let mut open = lock(&self.open);
         if let Some(batch) = open.get(&member.request.key) {
             let mut members = lock(&batch.members);
             if !members.sealed
-                && batch.send_at <= member.queue_deadline
+                && batch.send_at <= latest_send
                 && members.fits(&member.request, &self.limits)
             {
                 members.add(member);
@@ -132,11 +173,11 @@ impl Coalescer {
             }
         }
 
-        // A new batch needs its own upstream slot.
+        // A new batch needs its own upstream slot, early enough for this call.
         let slot = self
             .dispatcher
             .pacer()
-            .try_book(now, 1, self.limits.max_queue_wait)
+            .try_book(now, 1, latest_send.saturating_duration_since(now))
             .map_err(|retry_after| Saturated { retry_after })?;
         let mut members = Members::new(member.request.state_tokens);
         let key = member.request.key;
@@ -159,8 +200,32 @@ impl Coalescer {
 
     async fn run(self: Arc<Self>, batch: Arc<Batch>) {
         sleep_until(batch.send_at).await;
-        // Still open while it waits for a free upstream slot.
-        let permit = self.dispatcher.acquire().await;
+
+        // Wait for a free upstream connection, still open to new calls. The
+        // acquire future stays pinned across the loop, so the batch keeps its
+        // place in the semaphore's queue while callers who run out of
+        // patience are answered one by one.
+        let acquire = self.dispatcher.acquire();
+        tokio::pin!(acquire);
+        let permit = loop {
+            let expiry = lock(&batch.members)
+                .next_expiry()
+                .unwrap_or_else(Instant::now);
+            tokio::select! {
+                // A connection that is already free wins over a deadline that
+                // passed while the batch slept until `send_at`.
+                biased;
+                permit = &mut acquire => break permit,
+                () = sleep_until(expiry) => {
+                    if self.shed_expired(&batch, Instant::now()) {
+                        // Nobody is left: hand the request slot back.
+                        self.dispatcher.pacer().adjust(-1);
+                        return;
+                    }
+                }
+            }
+        };
+
         let calls = {
             let mut open = lock(&self.open);
             if open
@@ -174,6 +239,35 @@ impl Coalescer {
             std::mem::take(&mut members.calls)
         };
         self.dispatcher.dispatch(calls, permit, batch.opened).await;
+    }
+
+    /// Answers 429 to the callers of `batch` whose latest send time has
+    /// passed. Returns true if that emptied the batch, which is then closed.
+    fn shed_expired(&self, batch: &Arc<Batch>, now: Instant) -> bool {
+        let mut open = lock(&self.open);
+        let mut members = lock(&batch.members);
+        let expired = members.take_expired(now);
+        if !expired.is_empty() {
+            let retry_after = self.dispatcher.pacer().backlog(now).max(MIN_RETRY_AFTER);
+            let outcome = Outcome::Failed(GatewayError::rate_limited(
+                "every upstream connection stayed busy past max_queue_wait_ms",
+                retry_after,
+            ));
+            for member in expired {
+                let _ = member.reply.send(outcome.clone());
+            }
+        }
+        if !members.calls.is_empty() {
+            return false;
+        }
+        members.sealed = true;
+        if open
+            .get(&batch.key)
+            .is_some_and(|current| Arc::ptr_eq(current, batch))
+        {
+            open.remove(&batch.key);
+        }
+        true
     }
 
     /// Batches still accepting calls.
@@ -199,7 +293,6 @@ mod tests {
     use crate::tokens::TokenEstimator;
     use crate::upstream::{ApiKey, RetryPolicy, Upstream};
     use serde_json::json;
-    use tokio::sync::oneshot;
 
     fn request(state: &str, questions: serde_json::Value) -> PreparedRequest {
         let body = json!({"state": state, "model": "jev-latest", "questions": questions});
@@ -216,16 +309,29 @@ mod tests {
         }
     }
 
-    fn member(request: PreparedRequest) -> (Member, oneshot::Receiver<crate::dispatch::Outcome>) {
+    fn member(request: PreparedRequest) -> (Member, oneshot::Receiver<Outcome>) {
         let (reply, answer) = oneshot::channel();
         let now = Instant::now();
         let member = Member {
             request,
-            queue_deadline: now + Duration::from_secs(1),
+            latest_send: now + Duration::from_secs(1),
             deadline: now + Duration::from_secs(2),
             reply,
         };
         (member, answer)
+    }
+
+    /// Submits a call arriving now; keep the receiver alive or the call
+    /// counts as abandoned.
+    fn submit(
+        coalescer: &Arc<Coalescer>,
+        request: PreparedRequest,
+    ) -> Result<oneshot::Receiver<Outcome>, Saturated> {
+        let (reply, answer) = oneshot::channel();
+        let now = Instant::now();
+        coalescer
+            .submit(request, now, now + Duration::from_secs(2), reply)
+            .map(|()| answer)
     }
 
     fn coalescer(limits: BatchLimits, upstream_rpm: f64) -> Arc<Coalescer> {
@@ -290,12 +396,9 @@ mod tests {
     #[tokio::test]
     async fn calls_with_the_same_state_join_one_open_batch() {
         let coalescer = coalescer(limits(), 60_000.0);
-        let (a, _ra) = member(request("same", json!({"a": noul("A")})));
-        let (b, _rb) = member(request("same", json!({"b": noul("B")})));
-        let (c, _rc) = member(request("other", json!({"c": noul("C")})));
-        coalescer.submit(a).unwrap();
-        coalescer.submit(b).unwrap();
-        coalescer.submit(c).unwrap();
+        let _a = submit(&coalescer, request("same", json!({"a": noul("A")}))).unwrap();
+        let _b = submit(&coalescer, request("same", json!({"b": noul("B")}))).unwrap();
+        let _c = submit(&coalescer, request("other", json!({"c": noul("C")}))).unwrap();
         assert_eq!(coalescer.open_batches(), 2);
         let open = lock(&coalescer.open);
         let calls: Vec<usize> = open
@@ -309,13 +412,9 @@ mod tests {
     #[tokio::test]
     async fn a_full_batch_is_replaced_by_a_new_one() {
         let coalescer = coalescer(limits(), 60_000.0);
-        let (a, _ra) = member(request(
-            "s",
-            json!({"a": noul("A"), "b": noul("B"), "c": noul("C")}),
-        ));
-        let (b, _rb) = member(request("s", json!({"d": noul("D")})));
-        coalescer.submit(a).unwrap();
-        coalescer.submit(b).unwrap();
+        let full = request("s", json!({"a": noul("A"), "b": noul("B"), "c": noul("C")}));
+        let _a = submit(&coalescer, full).unwrap();
+        let _b = submit(&coalescer, request("s", json!({"d": noul("D")}))).unwrap();
         let open = lock(&coalescer.open);
         assert_eq!(open.len(), 1);
         let batch = open.values().next().unwrap();
@@ -333,17 +432,14 @@ mod tests {
             },
             60.0,
         );
-        let (a, _ra) = member(request("first", json!({"a": noul("A")})));
-        let (b, _rb) = member(request("second", json!({"b": noul("B")})));
-        let (c, _rc) = member(request("first", json!({"c": noul("C")})));
-        coalescer.submit(a).unwrap();
-        let refused = coalescer.submit(b).unwrap_err();
+        let _a = submit(&coalescer, request("first", json!({"a": noul("A")}))).unwrap();
+        let refused = submit(&coalescer, request("second", json!({"b": noul("B")}))).unwrap_err();
         assert!(
             refused.retry_after > Duration::from_millis(900),
             "{refused:?}"
         );
         // Joining an open batch needs no slot, so it still works.
-        coalescer.submit(c).unwrap();
+        let _c = submit(&coalescer, request("first", json!({"c": noul("C")}))).unwrap();
     }
 
     #[tokio::test]
@@ -355,10 +451,8 @@ mod tests {
             },
             60_000.0,
         );
-        let (a, _ra) = member(request("same", json!({"a": noul("A")})));
-        let (b, _rb) = member(request("same", json!({"b": noul("B")})));
-        coalescer.submit(a).unwrap();
-        coalescer.submit(b).unwrap();
+        let _a = submit(&coalescer, request("same", json!({"a": noul("A")}))).unwrap();
+        let _b = submit(&coalescer, request("same", json!({"b": noul("B")}))).unwrap();
         assert_eq!(coalescer.open_batches(), 0);
     }
 }
