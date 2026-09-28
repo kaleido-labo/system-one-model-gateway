@@ -1,0 +1,58 @@
+# systemone-gateway configuration. Every key below [server], [upstream] and
+# [coalescing] is optional and shows its default value.
+#
+# The file holds no secret: services are identified by the SHA-256 of their
+# key, and the TypeSafe key comes from the environment variable named in
+# upstream.api_key_env.
+
+[server]
+listen = "0.0.0.0:8080"        # POST /v1/systemone, GET /v1/models
+admin_listen = "0.0.0.0:9090"  # /healthz, /readyz, /metrics
+request_timeout_ms = 9000      # under the TypeSafe SDKs' 10 s default timeout
+max_body_bytes = 2097152
+log_format = "text"            # or "json"
+
+[upstream]
+base_url = "https://api.typesafe.ai"
+api_key_env = "TYPESAFE_API_KEY"
+# The account's limits, shared by every service below. If you run N replicas,
+# give each one 1/N of the account's limits.
+requests_per_minute = 1200
+# burst = 20                   # defaults to one second's worth of requests
+tokens_per_second = 250000
+max_concurrency = 64
+connect_timeout_ms = 2000
+attempt_timeout_ms = 5000
+max_retries = 3
+backoff_initial_ms = 200
+backoff_max_ms = 3000
+max_queue_wait_ms = 2000       # past this, callers get 429 + retry-after
+models_cache_ttl_ms = 300000
+
+[coalescing]
+window_ms = 10                 # 0 turns merging off
+max_questions = 128
+max_request_tokens = 56000     # vendor limit: 64k
+max_state_plus_question_tokens = 28000  # vendor limit: 32k
+bytes_per_token = 3.0
+
+# One block per calling service. Generate a key and its hash with
+#   systemone-gateway gen-key
+# give the key to the service (as TYPESAFE_API_KEY) and put the hash here.
+# The hashes below are placeholders that match no key.
+
+[[service]]
+name = "ocr-service"
+key_sha256 = ["0000000000000000000000000000000000000000000000000000000000000001"]
+requests_per_minute = 600
+max_concurrent = 32
+
+[[service]]
+name = "receipt-location"
+key_sha256 = [
+  "0000000000000000000000000000000000000000000000000000000000000002",
+  # A second hash lets you rotate the key without downtime.
+  "0000000000000000000000000000000000000000000000000000000000000003",
+]
+requests_per_minute = 300
+allowed_models = ["jev-latest", "jev-1.13.0"]
