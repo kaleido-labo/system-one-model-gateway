@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime};
 use axum::http::header::{ACCEPT, CONTENT_TYPE, RETRY_AFTER};
 use axum::http::{HeaderMap, StatusCode};
 use bytes::Bytes;
-use tokio::time::{Instant, sleep, sleep_until};
+use tokio::time::{Instant, sleep_until};
 use tracing::warn;
 
 use crate::error::RETRY_AFTER_MS;
@@ -190,17 +190,25 @@ impl Upstream {
                 // Everyone is over the vendor's limit, not just this call.
                 self.pacer.pause_until(Instant::now() + delay);
             }
-            if attempt >= self.retry.max_retries || Instant::now() + delay >= deadline {
+            if attempt >= self.retry.max_retries {
+                break Err(failure);
+            }
+            // A retry is one more request against the account's limit, so it
+            // takes a slot like any other call.
+            let now = Instant::now();
+            let retry_at = self.pacer.book(now, 1).max(now + delay);
+            if retry_at >= deadline {
+                self.pacer.adjust(-1);
                 break Err(failure);
             }
             warn!(
                 attempt = attempt + 1,
-                delay_ms = delay.as_millis() as u64,
+                delay_ms = retry_at.saturating_duration_since(now).as_millis() as u64,
                 failure = %describe(&failure),
                 "retrying the TypeSafe call"
             );
             self.metrics.upstream_retries.inc();
-            sleep(delay).await;
+            sleep_until(retry_at).await;
             attempt += 1;
             last_failure = Some(failure);
         };
