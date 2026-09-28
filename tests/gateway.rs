@@ -554,3 +554,35 @@ async fn a_spent_tokens_per_second_budget_sheds_with_429() {
     );
     assert_eq!(h.mock.state.calls(), 1);
 }
+
+#[tokio::test]
+async fn a_call_stuck_behind_busy_upstream_slots_gets_429_instead_of_a_late_send() {
+    // One upstream call at a time, and TypeSafe takes a second to answer: the
+    // second call's queue deadline passes while it waits for the only slot.
+    let h = Harness::start(Setup {
+        server: "request_timeout_ms = 5000",
+        upstream: "max_concurrency = 1\nmax_queue_wait_ms = 300",
+        coalescing: "window_ms = 10",
+        ..Setup::default()
+    })
+    .await;
+    h.mock.state.set_delay(Duration::from_secs(1));
+    let (first, second) = tokio::join!(
+        h.call(
+            "key-ocr",
+            call_body(json!("receipt A"), json!({"a": noul("A?")}))
+        ),
+        async {
+            sleep(Duration::from_millis(50)).await;
+            h.call(
+                "key-fraud",
+                call_body(json!("receipt B"), json!({"b": noul("B?")})),
+            )
+            .await
+        },
+    );
+    assert_eq!(first.status, 200, "{}", first.text);
+    assert_eq!(second.status, 429, "{}", second.text);
+    assert!(second.header("retry-after-ms").parse::<u64>().unwrap() >= 500);
+    assert_eq!(h.mock.state.calls(), 1);
+}
