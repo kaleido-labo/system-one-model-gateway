@@ -6,6 +6,13 @@
 //! question's `instructions`. The real API has no such field, and the gateway
 //! treats answers as opaque, so the echo lets a test check that each caller
 //! got the answer to its own question after a merge.
+//!
+//! It also serves an OpenAI-compatible `POST /v1/chat/completions` that
+//! answers every prompt with one token and its `top_logprobs`, like a chat
+//! model behind the Hugging Face router. The distribution is fixed by the
+//! kind of question the prompt asks. A Yes/No prompt containing `yes=0.9`
+//! gets P(Yes) = 0.9, split over the tokens " Yes" and "Yes". A prompt
+//! containing POISON gets tokens that are no label.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -50,6 +57,8 @@ pub struct MockState {
     api_key: String,
     /// Bodies of every `POST /v1/systemone`, as received.
     received: Mutex<Vec<String>>,
+    /// Bodies of every `POST /v1/chat/completions`, as received.
+    chat_received: Mutex<Vec<String>>,
     /// When each of them arrived.
     arrivals: Mutex<Vec<std::time::Instant>>,
     script: Mutex<VecDeque<Scripted>>,
@@ -92,6 +101,26 @@ impl MockState {
     pub fn models_calls(&self) -> usize {
         self.models_calls.load(Ordering::SeqCst)
     }
+
+    /// The `prompt_tokens` the mock billed across every chat request.
+    pub fn chat_billed(&self) -> u64 {
+        self.chat_received
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|body| (body.len() / 4) as u64)
+            .sum()
+    }
+
+    /// Every chat request received, parsed.
+    pub fn chat_requests(&self) -> Vec<Value> {
+        self.chat_received
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|body| serde_json::from_str(body).unwrap())
+            .collect()
+    }
 }
 
 pub struct MockUpstream {
@@ -106,6 +135,7 @@ impl MockUpstream {
         let state = Arc::new(MockState {
             api_key: api_key.to_owned(),
             received: Mutex::new(Vec::new()),
+            chat_received: Mutex::new(Vec::new()),
             arrivals: Mutex::new(Vec::new()),
             script: Mutex::new(VecDeque::new()),
             delay: Mutex::new(Duration::ZERO),
@@ -114,6 +144,7 @@ impl MockUpstream {
         let app = Router::new()
             .route("/v1/systemone", post(systemone))
             .route("/v1/models", get(models))
+            .route("/v1/chat/completions", post(chat))
             .with_state(Arc::clone(&state));
         let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -257,4 +288,100 @@ async fn models(State(state): State<Arc<MockState>>, headers: HeaderMap) -> Resp
         {"name": "jev-preview", "description": "Most recent release", "release_date": "2026-09-15"},
     ]});
     json_response(200, &[], body.to_string())
+}
+
+async fn chat(State(state): State<Arc<MockState>>, headers: HeaderMap, body: Bytes) -> Response {
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    let call = {
+        let mut received = state.chat_received.lock().unwrap();
+        received.push(text.clone());
+        received.len()
+    };
+    if !authorized(&state, &headers) {
+        return json_response(
+            401,
+            &[],
+            json!({"error": "Invalid credentials"}).to_string(),
+        );
+    }
+    let delay = *state.delay.lock().unwrap();
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
+    let scripted = state.script.lock().unwrap().pop_front();
+    if let Some(scripted) = scripted {
+        return json_response(scripted.status, &scripted.headers, scripted.body);
+    }
+
+    let request: Value = serde_json::from_str(&text).unwrap();
+    let prompt = request["messages"]
+        .as_array()
+        .and_then(|messages| messages.last())
+        .and_then(|message| message["content"].as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let mut top = token_distribution(&prompt);
+    let wanted = request["top_logprobs"].as_u64().unwrap_or(0) as usize;
+    top.truncate(wanted);
+    let top: Vec<Value> = top
+        .iter()
+        .map(|(token, p)| json!({"token": token, "logprob": p.ln()}))
+        .collect();
+    let first = top
+        .first()
+        .cloned()
+        .unwrap_or(json!({"token": "", "logprob": 0.0}));
+    let prompt_tokens = text.len() / 4;
+    let body = json!({
+        "id": format!("chatcmpl-{call}"),
+        "object": "chat.completion",
+        "model": request["model"],
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": first["token"]},
+            "logprobs": {"content": [{
+                "token": first["token"],
+                "logprob": first["logprob"],
+                "top_logprobs": top,
+            }]},
+            "finish_reason": "length",
+        }],
+        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": 1, "total_tokens": prompt_tokens + 1},
+    });
+    json_response(
+        200,
+        &[("x-request-id", format!("chat_{call}"))],
+        body.to_string(),
+    )
+}
+
+/// The first-token candidates for a prompt, most likely first.
+fn token_distribution(prompt: &str) -> Vec<(&'static str, f64)> {
+    if prompt.contains("POISON") {
+        return vec![("Sorry", 0.9), ("I", 0.1)];
+    }
+    if prompt.contains("Reply with Yes or No only.") {
+        let yes = prompt
+            .split("yes=")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|value| value.parse::<f64>().ok())
+            .unwrap_or(0.7);
+        let mut top = vec![
+            (" Yes", yes * 0.75),
+            ("Yes", yes * 0.25),
+            ("No", (1.0 - yes) * 0.9),
+            ("Maybe", (1.0 - yes) * 0.1),
+        ];
+        top.retain(|(_, p)| *p > 0.0);
+        top.sort_by(|a, b| b.1.total_cmp(&a.1));
+        return top;
+    }
+    if prompt.contains("Reply with the letter of one option only.") {
+        return vec![("A", 0.6), (" B", 0.3), ("The", 0.1)];
+    }
+    if prompt.contains("Reply with the number of one level only.") {
+        return vec![("1", 0.5), ("2", 0.3), ("Level", 0.2)];
+    }
+    vec![("Hello", 1.0)]
 }
