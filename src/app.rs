@@ -6,19 +6,16 @@ use std::sync::atomic::AtomicBool;
 
 use anyhow::Context;
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::info;
 
 use crate::api::{AppState, Shared, admin_router, public_router};
-use crate::coalescer::{BatchLimits, Coalescer};
+use crate::backend::Backends;
 use crate::config::{Config, millis};
-use crate::dispatch::Dispatcher;
-use crate::limiter::Gcra;
 use crate::metrics::Metrics;
 use crate::services::ServiceRegistry;
 use crate::tokens::TokenEstimator;
-use crate::upstream::{ApiKey, RetryPolicy, Upstream};
 
 /// Both servers, listening.
 pub struct Gateway {
@@ -31,9 +28,13 @@ pub struct Gateway {
 
 impl Gateway {
     /// Binds both listeners and starts serving. Port 0 picks a free port;
-    /// the chosen addresses are in `public_addr` and `admin_addr`.
-    pub async fn start(config: &Config, api_key: ApiKey) -> anyhow::Result<Self> {
-        let state = build_state(config, api_key)?;
+    /// the chosen addresses are in `public_addr` and `admin_addr`. `env`
+    /// looks up an environment variable by name, for the backends' keys.
+    pub async fn start(
+        config: &Config,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> anyhow::Result<Self> {
+        let state = build_state(config, &env)?;
         let public = TcpListener::bind(config.server.listen)
             .await
             .with_context(|| format!("could not listen on {}", config.server.listen))?;
@@ -64,7 +65,13 @@ impl Gateway {
                 .await
         });
         state.set_ready(true);
-        info!(%public_addr, %admin_addr, services = config.services.len(), "gateway listening");
+        info!(
+            %public_addr,
+            %admin_addr,
+            services = config.services.len(),
+            backends = config.backends.len(),
+            "gateway listening"
+        );
         Ok(Self {
             public_addr,
             admin_addr,
@@ -88,57 +95,14 @@ impl Gateway {
     }
 }
 
-fn build_state(config: &Config, api_key: ApiKey) -> anyhow::Result<AppState> {
-    let upstream_config = &config.upstream;
+fn build_state(config: &Config, env: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<AppState> {
     let metrics = Arc::new(Metrics::new());
-    let pacer = Arc::new(Gcra::per_minute(
-        f64::from(upstream_config.requests_per_minute),
-        u64::from(upstream_config.burst()),
-    ));
-    let upstream = Arc::new(Upstream::new(
-        &upstream_config.base_url,
-        api_key,
-        millis(upstream_config.connect_timeout_ms),
-        RetryPolicy {
-            max_retries: upstream_config.max_retries,
-            backoff_initial: millis(upstream_config.backoff_initial_ms),
-            backoff_max: millis(upstream_config.backoff_max_ms),
-            attempt_timeout: millis(upstream_config.attempt_timeout_ms),
-        },
-        Arc::clone(&pacer),
-        Arc::clone(&metrics),
-    )?);
-    // One second of tokens may go at once.
-    let tokens_per_second = u64::from(upstream_config.tokens_per_second);
-    let token_pacer = Gcra::per_second(tokens_per_second as f64, tokens_per_second);
-    let dispatcher = Arc::new(Dispatcher::new(
-        Arc::clone(&upstream),
-        pacer,
-        token_pacer,
-        upstream_config.max_concurrency,
-        Arc::clone(&metrics),
-    ));
-    let coalescing = &config.coalescing;
-    let coalescer = Arc::new(Coalescer::new(
-        BatchLimits {
-            window: millis(coalescing.window_ms),
-            max_questions: coalescing.max_questions,
-            max_request_tokens: coalescing.max_request_tokens,
-            max_state_plus_question_tokens: coalescing.max_state_plus_question_tokens,
-            max_queue_wait: millis(upstream_config.max_queue_wait_ms),
-        },
-        dispatcher,
-    ));
     Ok(AppState::new(Shared {
         registry: ServiceRegistry::from_config(&config.services),
-        coalescer,
-        upstream,
+        backends: Backends::build(config, env, &metrics)?,
         metrics,
-        estimator: TokenEstimator::new(coalescing.bytes_per_token),
+        estimator: TokenEstimator::new(config.coalescing.bytes_per_token),
         request_timeout: millis(config.server.request_timeout_ms),
-        max_queue_wait: millis(upstream_config.max_queue_wait_ms),
-        models_ttl: millis(upstream_config.models_cache_ttl_ms),
-        models_cache: Mutex::new(None),
         ready: AtomicBool::new(false),
     }))
 }

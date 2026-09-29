@@ -1,6 +1,7 @@
-//! The one HTTP client that talks to TypeSafe, with its retry policy.
+//! The HTTP client of one backend, with its retry policy.
 //!
-//! Retries follow the vendor's guidance (https://docs.typesafe.ai/api.md):
+//! Retries follow TypeSafe's guidance (https://docs.typesafe.ai/api.md),
+//! which suits OpenAI-compatible servers as well:
 //! 429 and 529 are retried with exponential backoff, and `retry-after-ms` or
 //! `retry-after` wins over the computed delay when the vendor sends one. 5xx
 //! and network errors are retried the same way. Every retry stays inside the
@@ -18,16 +19,20 @@ use tracing::warn;
 
 use crate::error::RETRY_AFTER_MS;
 use crate::limiter::Gcra;
-use crate::metrics::{Metrics, StatusLabels};
+use crate::metrics::{Metrics, UpstreamLabels};
 
-/// Response header carrying the vendor's id for a request.
+/// Response header carrying the vendor's id for a request. The gateway
+/// hands the id back under this name whatever the backend, so SDK users
+/// find it where they expect it.
 pub const REQUEST_ID: &str = "x-typesafe-request-id";
+/// Where OpenAI-compatible servers put their request id.
+const GENERIC_REQUEST_ID: &str = "x-request-id";
 
 /// Longest `retry-after` the gateway will honour. A larger value is capped
 /// rather than trusted, so one odd header cannot stall every service.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 
-/// The TypeSafe API key. Debug output never shows it.
+/// A backend's API key. Debug output never shows it.
 #[derive(Clone)]
 pub struct ApiKey(String);
 
@@ -73,7 +78,7 @@ pub struct UpstreamReply {
 
 #[derive(Debug, Clone)]
 pub enum UpstreamFailure {
-    /// TypeSafe answered with an error status, after any retries.
+    /// The backend answered with an error status, after any retries.
     Status {
         status: StatusCode,
         body: Bytes,
@@ -83,17 +88,21 @@ pub enum UpstreamFailure {
     /// No usable response: refused or reset connection, TLS failure, or an
     /// attempt that timed out, after any retries.
     Transport { timed_out: bool, detail: String },
-    /// TypeSafe asked everyone to back off past the calls' deadline.
+    /// The backend asked everyone to back off past the calls' deadline, or
+    /// its request slots are booked past it.
     Paused { retry_after: Duration },
     /// The deadline passed before an attempt could start.
     Deadline,
+    /// The backend answered 200 with a body the gateway cannot use.
+    Unreadable(String),
 }
 
 pub struct Upstream {
+    /// The backend's name, for metrics and logs.
+    name: String,
     client: reqwest::Client,
-    systemone_url: reqwest::Url,
-    models_url: reqwest::Url,
-    api_key: ApiKey,
+    base: reqwest::Url,
+    api_key: Option<ApiKey>,
     retry: RetryPolicy,
     /// The shared request pacer, paused here when the vendor answers 429.
     pacer: Arc<Gcra>,
@@ -102,8 +111,9 @@ pub struct Upstream {
 
 impl Upstream {
     pub fn new(
+        name: &str,
         base_url: &str,
-        api_key: ApiKey,
+        api_key: Option<ApiKey>,
         connect_timeout: Duration,
         retry: RetryPolicy,
         pacer: Arc<Gcra>,
@@ -121,9 +131,9 @@ impl Upstream {
             .pool_idle_timeout(Duration::from_secs(90))
             .build()?;
         Ok(Self {
+            name: name.to_owned(),
             client,
-            systemone_url: base.join("v1/systemone")?,
-            models_url: base.join("v1/models")?,
+            base,
             api_key,
             retry,
             pacer,
@@ -131,22 +141,40 @@ impl Upstream {
         })
     }
 
-    /// `POST /v1/systemone` with `body`, retried until `deadline`.
-    pub async fn systemone(
+    /// The backend's request pacer.
+    pub fn pacer(&self) -> &Arc<Gcra> {
+        &self.pacer
+    }
+
+    /// `path` resolved against the base URL, which keeps its own path:
+    /// `chat/completions` under `https://router.huggingface.co/v1` is
+    /// `https://router.huggingface.co/v1/chat/completions`.
+    pub fn endpoint(&self, path: &str) -> anyhow::Result<reqwest::Url> {
+        Ok(self.base.join(path)?)
+    }
+
+    /// POSTs the JSON `body` to `url`, retried until `deadline`.
+    pub async fn post(
         &self,
+        url: &reqwest::Url,
         body: Bytes,
         deadline: Instant,
     ) -> Result<UpstreamReply, UpstreamFailure> {
-        self.call(Some(body), deadline).await
+        self.call(url, Some(body), deadline).await
     }
 
-    /// `GET /v1/models`, retried until `deadline`.
-    pub async fn models(&self, deadline: Instant) -> Result<UpstreamReply, UpstreamFailure> {
-        self.call(None, deadline).await
+    /// GETs `url`, retried until `deadline`.
+    pub async fn get(
+        &self,
+        url: &reqwest::Url,
+        deadline: Instant,
+    ) -> Result<UpstreamReply, UpstreamFailure> {
+        self.call(url, None, deadline).await
     }
 
     async fn call(
         &self,
+        url: &reqwest::Url,
         body: Option<Bytes>,
         deadline: Instant,
     ) -> Result<UpstreamReply, UpstreamFailure> {
@@ -156,7 +184,7 @@ impl Upstream {
         let result = loop {
             let now = Instant::now();
             if self.pacer.resume_at(now).is_some() {
-                // This attempt's slot fell inside a pause TypeSafe asked for.
+                // This attempt's slot fell inside a pause the backend asked for.
                 // Waking up at the end of the pause would send every held
                 // batch at the same instant, so take a fresh slot after it,
                 // spaced like any other booking, then look again in case the
@@ -177,7 +205,7 @@ impl Upstream {
             }
 
             let failure = match self
-                .attempt(body.clone(), remaining.min(self.retry.attempt_timeout))
+                .attempt(url, body.clone(), remaining.min(self.retry.attempt_timeout))
                 .await
             {
                 Ok(reply) => break Ok(reply),
@@ -210,12 +238,16 @@ impl Upstream {
                 break Err(failure);
             }
             warn!(
+                backend = %self.name,
                 attempt = attempt + 1,
                 delay_ms = retry_at.saturating_duration_since(now).as_millis() as u64,
                 failure = %describe(&failure),
-                "retrying the TypeSafe call"
+                "retrying the upstream call"
             );
-            self.metrics.upstream_retries.inc();
+            self.metrics
+                .upstream_retries
+                .get_or_create(&Metrics::backend(&self.name))
+                .inc();
             sleep_until(retry_at).await;
             attempt += 1;
             last_failure = Some(failure);
@@ -225,16 +257,24 @@ impl Upstream {
             Ok(_) => Some(200),
             Err(UpstreamFailure::Status { status, .. }) => Some(status.as_u16()),
             Err(UpstreamFailure::Transport { .. }) => Some(0),
-            Err(UpstreamFailure::Paused { .. } | UpstreamFailure::Deadline) => None,
+            Err(
+                UpstreamFailure::Paused { .. }
+                | UpstreamFailure::Deadline
+                | UpstreamFailure::Unreadable(_),
+            ) => None,
         };
         // A call that never started is not an upstream call.
         if let Some(status) = status {
             self.metrics
                 .upstream_calls
-                .get_or_create(&StatusLabels { status })
+                .get_or_create(&UpstreamLabels {
+                    backend: self.name.clone(),
+                    status,
+                })
                 .inc();
             self.metrics
                 .upstream_duration
+                .get_or_create(&Metrics::backend(&self.name))
                 .observe(started.elapsed().as_secs_f64());
         }
         result
@@ -242,19 +282,22 @@ impl Upstream {
 
     async fn attempt(
         &self,
+        url: &reqwest::Url,
         body: Option<Bytes>,
         timeout: Duration,
     ) -> Result<UpstreamReply, UpstreamFailure> {
-        let request = match body {
+        let mut request = match body {
             Some(body) => self
                 .client
-                .post(self.systemone_url.clone())
+                .post(url.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(body),
-            None => self.client.get(self.models_url.clone()),
+            None => self.client.get(url.clone()),
         };
+        if let Some(key) = &self.api_key {
+            request = request.bearer_auth(&key.0);
+        }
         let response = request
-            .bearer_auth(&self.api_key.0)
             .header(ACCEPT, "application/json")
             .timeout(timeout)
             .send()
@@ -262,11 +305,15 @@ impl Upstream {
             .map_err(transport_failure)?;
 
         let status = response.status();
-        let request_id = response
-            .headers()
-            .get(REQUEST_ID)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
+        let request_id = [REQUEST_ID, GENERIC_REQUEST_ID]
+            .into_iter()
+            .find_map(|name| {
+                response
+                    .headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned)
+            });
         let retry_after = parse_retry_after(response.headers(), SystemTime::now());
         let body = response.bytes().await.map_err(transport_failure)?;
         if status.is_success() {
@@ -295,7 +342,9 @@ fn is_retryable(failure: &UpstreamFailure) -> bool {
             matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504 | 529)
         }
         UpstreamFailure::Transport { .. } => true,
-        UpstreamFailure::Paused { .. } | UpstreamFailure::Deadline => false,
+        UpstreamFailure::Paused { .. }
+        | UpstreamFailure::Deadline
+        | UpstreamFailure::Unreadable(_) => false,
     }
 }
 
@@ -310,6 +359,7 @@ pub fn describe(failure: &UpstreamFailure) -> String {
             format!("paused for {} ms after a 429", retry_after.as_millis())
         }
         UpstreamFailure::Deadline => "deadline reached".to_owned(),
+        UpstreamFailure::Unreadable(reason) => format!("unreadable answer: {reason}"),
     }
 }
 

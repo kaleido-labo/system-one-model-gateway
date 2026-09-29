@@ -1,10 +1,10 @@
 //! Gateway configuration, read from a TOML file.
 //!
 //! The file holds no secret: services are identified by the SHA-256 of their
-//! key, and the TypeSafe key is read from the environment variable the file
-//! names. The file can live in git or in a Kubernetes ConfigMap.
+//! key, and each backend's key is read from the environment variable the
+//! file names. The file can live in git or in a Kubernetes ConfigMap.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
@@ -12,13 +12,19 @@ use std::time::Duration;
 use anyhow::{Context, bail, ensure};
 use serde::Deserialize;
 
+use crate::pattern::ModelPattern;
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
+    /// The `[upstream]` table of earlier versions, kept only to explain
+    /// that `[[backend]]` replaced it.
     #[serde(default)]
-    pub upstream: UpstreamConfig,
+    upstream: Option<toml::Value>,
+    #[serde(default, rename = "backend")]
+    pub backends: Vec<BackendConfig>,
     #[serde(default)]
     pub coalescing: CoalescingConfig,
     #[serde(default, rename = "service")]
@@ -60,19 +66,59 @@ pub enum LogFormat {
     Json,
 }
 
+/// How the gateway talks to a backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Protocol {
+    /// `POST /v1/systemone`, as documented by TypeSafe. Calls are forwarded
+    /// as they are, merged calls included. Any server speaking the same API
+    /// fits here, TypeSafe or not.
+    Systemone,
+    /// An OpenAI-compatible `POST /chat/completions` with `logprobs`: the
+    /// Hugging Face router, Inference Endpoints, TGI, vLLM. Each question
+    /// becomes one chat call, and its answer is read from the probabilities
+    /// of the first generated token (see `chat`).
+    Chat,
+}
+
+/// One model provider behind the gateway, with its own key and limits.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
-pub struct UpstreamConfig {
-    pub base_url: String,
-    /// Environment variable holding the TypeSafe API key.
-    pub api_key_env: String,
-    /// The account's limits, shared by every service behind the gateway.
+pub struct BackendConfig {
+    /// Shows up in metrics, logs and the `x-systemone-gateway-backend` header.
+    pub name: String,
+    pub protocol: Protocol,
+    /// Defaults to TypeSafe for `systemone`. Required for `chat`, where it
+    /// is the URL `chat/completions` hangs off, such as
+    /// `https://router.huggingface.co/v1`.
+    pub base_url: Option<String>,
+    /// Environment variable holding the backend's API key, sent as a bearer
+    /// token. Unset sends no key, for a server on a private network.
+    pub api_key_env: Option<String>,
+    /// Model names this backend serves. A trailing `*` matches any name
+    /// starting with what comes before it, and `*` alone matches every name.
+    /// A call goes to the backend with the most specific match: an exact
+    /// name first, then the longest prefix.
+    pub models: Vec<String>,
+    /// `chat` only: the model id sent upstream in place of the name the
+    /// service asked for. Unset forwards the service's name as it is.
+    pub upstream_model: Option<String>,
+    /// `chat` only: how many most likely tokens the backend returns. The
+    /// Hugging Face router accepts at most 5; vLLM and TGI allow more.
+    pub top_logprobs: u8,
+    /// `chat` only: extra fields merged into every chat request, for
+    /// settings the gateway does not know about, such as
+    /// `chat_template_kwargs = { enable_thinking = false }` for vLLM. The
+    /// fields the gateway sets itself win over these.
+    pub request_extras: toml::Table,
+    /// The backend's limits, shared by every service behind the gateway.
     /// Defaults are Jev 1.13's published limits (https://docs.typesafe.ai/models.md).
     pub requests_per_minute: u32,
     /// Requests that may leave back to back. Defaults to one second's worth.
     pub burst: Option<u32>,
     pub tokens_per_second: u32,
-    /// Upstream calls in flight at once.
+    /// Upstream calls in flight at once. For `chat`, one call is one merged
+    /// batch, which sends a chat request per question.
     pub max_concurrency: usize,
     pub connect_timeout_ms: u64,
     /// Timeout of one upstream attempt; retries get a fresh one.
@@ -86,15 +132,24 @@ pub struct UpstreamConfig {
     /// would wait longer gets a 429 with a retry-after at that moment, and
     /// the caller's SDK backs off.
     pub max_queue_wait_ms: u64,
-    /// How long `GET /v1/models` is served from memory.
+    /// `systemone` only: how long the backend's `GET /v1/models` is served
+    /// from memory.
     pub models_cache_ttl_ms: u64,
 }
 
-impl Default for UpstreamConfig {
+pub const TYPESAFE_URL: &str = "https://api.typesafe.ai";
+
+impl Default for BackendConfig {
     fn default() -> Self {
         Self {
-            base_url: "https://api.typesafe.ai".to_owned(),
-            api_key_env: "TYPESAFE_API_KEY".to_owned(),
+            name: String::new(),
+            protocol: Protocol::Systemone,
+            base_url: None,
+            api_key_env: None,
+            models: vec!["*".to_owned()],
+            upstream_model: None,
+            top_logprobs: 5,
+            request_extras: toml::Table::new(),
             requests_per_minute: 1_200,
             burst: None,
             tokens_per_second: 250_000,
@@ -110,9 +165,23 @@ impl Default for UpstreamConfig {
     }
 }
 
-impl UpstreamConfig {
+impl BackendConfig {
+    /// The backend used when the file declares none: TypeSafe, for every
+    /// model, with its key in `TYPESAFE_API_KEY`.
+    pub fn typesafe() -> Self {
+        Self {
+            name: "typesafe".to_owned(),
+            api_key_env: Some("TYPESAFE_API_KEY".to_owned()),
+            ..Self::default()
+        }
+    }
+
     pub fn burst(&self) -> u32 {
         self.burst.unwrap_or(self.requests_per_minute / 60).max(1)
+    }
+
+    pub fn base_url(&self) -> &str {
+        self.base_url.as_deref().unwrap_or(TYPESAFE_URL)
     }
 }
 
@@ -171,6 +240,95 @@ impl ServiceConfig {
     }
 }
 
+impl BackendConfig {
+    fn validate(&self, server: &ServerConfig) -> anyhow::Result<()> {
+        let name = &self.name;
+        ensure!(
+            valid_name(name),
+            "backend name {name:?} must be non-empty and use only letters, digits, '-', '_' or '.'"
+        );
+        let url = reqwest::Url::parse(self.base_url())
+            .with_context(|| format!("backend {name:?}: base_url is not a URL"))?;
+        ensure!(
+            matches!(url.scheme(), "http" | "https"),
+            "backend {name:?}: base_url must be an http or https URL"
+        );
+        if let Some(variable) = &self.api_key_env {
+            ensure!(
+                !variable.is_empty(),
+                "backend {name:?}: api_key_env must name a variable, or be left out for no key"
+            );
+        }
+        ensure!(
+            !self.models.is_empty(),
+            "backend {name:?}: models must list at least one model name or pattern"
+        );
+        for model in &self.models {
+            ModelPattern::parse(model).with_context(|| format!("backend {name:?}: models"))?;
+        }
+        match self.protocol {
+            Protocol::Systemone => {
+                ensure!(
+                    self.upstream_model.is_none(),
+                    "backend {name:?}: upstream_model only applies to protocol = \"chat\""
+                );
+                ensure!(
+                    self.request_extras.is_empty(),
+                    "backend {name:?}: request_extras only applies to protocol = \"chat\""
+                );
+            }
+            Protocol::Chat => {
+                ensure!(
+                    self.base_url.is_some(),
+                    "backend {name:?}: a chat backend needs a base_url, \
+                     such as https://router.huggingface.co/v1"
+                );
+                ensure!(
+                    (1..=20).contains(&self.top_logprobs),
+                    "backend {name:?}: top_logprobs must be between 1 and 20"
+                );
+                if let Some(model) = &self.upstream_model {
+                    ensure!(
+                        !model.trim().is_empty(),
+                        "backend {name:?}: upstream_model must not be empty"
+                    );
+                }
+            }
+        }
+        ensure!(
+            self.requests_per_minute > 0,
+            "backend {name:?}: requests_per_minute must be positive"
+        );
+        ensure!(
+            self.tokens_per_second > 0,
+            "backend {name:?}: tokens_per_second must be positive"
+        );
+        ensure!(
+            self.max_concurrency > 0,
+            "backend {name:?}: max_concurrency must be positive"
+        );
+        ensure!(
+            self.attempt_timeout_ms > 0,
+            "backend {name:?}: attempt_timeout_ms must be positive"
+        );
+        ensure!(
+            self.max_queue_wait_ms < server.request_timeout_ms,
+            "backend {name:?}: max_queue_wait_ms ({}) must be shorter than \
+             server.request_timeout_ms ({}), or queued calls would time out before they are sent",
+            self.max_queue_wait_ms,
+            server.request_timeout_ms
+        );
+        Ok(())
+    }
+}
+
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)
@@ -180,7 +338,10 @@ impl Config {
     }
 
     pub fn from_toml(text: &str) -> anyhow::Result<Self> {
-        let config: Self = toml::from_str(text)?;
+        let mut config: Self = toml::from_str(text)?;
+        if config.backends.is_empty() && config.upstream.is_none() {
+            config.backends.push(BackendConfig::typesafe());
+        }
         config.validate()?;
         Ok(config)
     }
@@ -196,40 +357,31 @@ impl Config {
             "server.max_body_bytes must be positive"
         );
 
-        let upstream = &self.upstream;
-        let url = reqwest::Url::parse(&upstream.base_url)
-            .with_context(|| format!("upstream.base_url {:?} is not a URL", upstream.base_url))?;
         ensure!(
-            matches!(url.scheme(), "http" | "https"),
-            "upstream.base_url must be an http or https URL"
+            self.upstream.is_none(),
+            "[upstream] was replaced by [[backend]] blocks: rename the table to [[backend]] \
+             and give it name = \"typesafe\" and api_key_env = \"TYPESAFE_API_KEY\""
         );
-        ensure!(
-            !upstream.api_key_env.is_empty(),
-            "upstream.api_key_env must name a variable"
-        );
-        ensure!(
-            upstream.requests_per_minute > 0,
-            "upstream.requests_per_minute must be positive"
-        );
-        ensure!(
-            upstream.tokens_per_second > 0,
-            "upstream.tokens_per_second must be positive"
-        );
-        ensure!(
-            upstream.max_concurrency > 0,
-            "upstream.max_concurrency must be positive"
-        );
-        ensure!(
-            upstream.attempt_timeout_ms > 0,
-            "upstream.attempt_timeout_ms must be positive"
-        );
-        ensure!(
-            upstream.max_queue_wait_ms < server.request_timeout_ms,
-            "upstream.max_queue_wait_ms ({}) must be shorter than server.request_timeout_ms ({}), \
-             or queued calls would time out before they are sent",
-            upstream.max_queue_wait_ms,
-            server.request_timeout_ms
-        );
+        ensure!(!self.backends.is_empty(), "no [[backend]] configured");
+        let mut backend_names = HashSet::new();
+        let mut patterns = HashMap::new();
+        for backend in &self.backends {
+            backend.validate(server)?;
+            ensure!(
+                backend_names.insert(backend.name.as_str()),
+                "backend {:?} is configured twice",
+                backend.name
+            );
+            for pattern in &backend.models {
+                if let Some(other) = patterns.insert(pattern.as_str(), backend.name.as_str()) {
+                    bail!(
+                        "model {pattern:?} is listed by backends {other:?} and {:?}: \
+                         a model name must lead to one backend",
+                        backend.name
+                    );
+                }
+            }
+        }
 
         let coalescing = &self.coalescing;
         ensure!(
@@ -257,10 +409,7 @@ impl Config {
         for service in &self.services {
             let name = &service.name;
             ensure!(
-                !name.is_empty()
-                    && name
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')),
+                valid_name(name),
                 "service name {name:?} must be non-empty and use only letters, digits, '-', '_' or '.'"
             );
             ensure!(
@@ -291,9 +440,13 @@ impl Config {
             );
             if let Some(models) = &service.allowed_models {
                 ensure!(
-                    !models.is_empty() && models.iter().all(|m| !m.trim().is_empty()),
+                    !models.is_empty(),
                     "service {name:?}: allowed_models must list model names"
                 );
+                for model in models {
+                    ModelPattern::parse(model)
+                        .with_context(|| format!("service {name:?}: allowed_models"))?;
+                }
             }
         }
         Ok(())
@@ -318,8 +471,15 @@ mod tests {
     #[test]
     fn a_single_service_is_enough_and_defaults_fill_the_rest() {
         let config = Config::from_toml(&with_service("")).unwrap();
-        assert_eq!(config.upstream.requests_per_minute, 1_200);
-        assert_eq!(config.upstream.burst(), 20);
+        assert_eq!(config.backends.len(), 1);
+        let backend = &config.backends[0];
+        assert_eq!(backend.name, "typesafe");
+        assert_eq!(backend.protocol, Protocol::Systemone);
+        assert_eq!(backend.base_url(), TYPESAFE_URL);
+        assert_eq!(backend.api_key_env.as_deref(), Some("TYPESAFE_API_KEY"));
+        assert_eq!(backend.models, ["*"]);
+        assert_eq!(backend.requests_per_minute, 1_200);
+        assert_eq!(backend.burst(), 20);
         assert_eq!(config.coalescing.window_ms, 10);
         assert_eq!(config.server.listen.port(), 8080);
         assert_eq!(config.services[0].burst(), None);
@@ -330,6 +490,12 @@ mod tests {
         let text = include_str!("../config.example.toml");
         let config = Config::from_toml(text).unwrap();
         assert!(config.services.len() >= 2);
+        assert!(
+            config
+                .backends
+                .iter()
+                .any(|backend| backend.protocol == Protocol::Chat)
+        );
     }
 
     #[test]
@@ -376,7 +542,7 @@ mod tests {
         assert!(Config::from_toml(&bad_name).is_err());
 
         let slow_queue = format!(
-            "[server]\nrequest_timeout_ms = 1000\n[upstream]\nmax_queue_wait_ms = 1000\n{}",
+            "[server]\nrequest_timeout_ms = 1000\n[[backend]]\nname = \"t\"\nmax_queue_wait_ms = 1000\n{}",
             with_service("")
         );
         assert!(
@@ -386,10 +552,83 @@ mod tests {
                 .contains("shorter")
         );
 
-        let typo = format!("[upstream]\nrequest_per_minute = 10\n{}", with_service(""));
+        let typo = format!(
+            "[[backend]]\nname = \"t\"\nrequest_per_minute = 10\n{}",
+            with_service("")
+        );
         assert!(Config::from_toml(&typo).is_err());
 
         let zero_rate = with_service("requests_per_minute = 0");
         assert!(Config::from_toml(&zero_rate).is_err());
+    }
+
+    fn error_of(toml: &str) -> String {
+        format!(
+            "{:#}",
+            Config::from_toml(&format!("{toml}\n{}", with_service(""))).unwrap_err()
+        )
+    }
+
+    #[test]
+    fn a_chat_backend_sits_next_to_typesafe() {
+        let config = Config::from_toml(&format!(
+            r#"
+            [[backend]]
+            name = "typesafe"
+            api_key_env = "TYPESAFE_API_KEY"
+            models = ["jev-*"]
+
+            [[backend]]
+            name = "huggingface"
+            protocol = "chat"
+            base_url = "https://router.huggingface.co/v1"
+            api_key_env = "HF_TOKEN"
+            models = ["Qwen/*"]
+            requests_per_minute = 300
+            request_extras = {{ temperature = 0 }}
+            {}"#,
+            with_service("")
+        ))
+        .unwrap();
+        let hf = &config.backends[1];
+        assert_eq!(hf.protocol, Protocol::Chat);
+        assert_eq!(hf.base_url(), "https://router.huggingface.co/v1");
+        assert_eq!(hf.top_logprobs, 5);
+        assert_eq!(hf.burst(), 5);
+        assert_eq!(hf.request_extras["temperature"].as_integer(), Some(0));
+    }
+
+    #[test]
+    fn rejects_backend_setups_that_cannot_work() {
+        assert!(error_of("[upstream]\nrequests_per_minute = 10").contains("[[backend]]"));
+        assert!(error_of("[[backend]]\nmodels = [\"*\"]").contains("backend name"));
+        assert!(
+            error_of("[[backend]]\nname = \"a\"\n[[backend]]\nname = \"b\"")
+                .contains("listed by backends")
+        );
+        assert!(
+            error_of(
+                "[[backend]]\nname = \"a\"\nmodels = [\"x\"]\n\
+                 [[backend]]\nname = \"a\"\nmodels = [\"y\"]"
+            )
+            .contains("twice")
+        );
+        assert!(error_of("[[backend]]\nname = \"hf\"\nprotocol = \"chat\"").contains("base_url"));
+        assert!(
+            error_of("[[backend]]\nname = \"t\"\nupstream_model = \"m\"").contains("only applies")
+        );
+        assert!(
+            error_of(
+                "[[backend]]\nname = \"hf\"\nprotocol = \"chat\"\nbase_url = \"http://x/v1\"\n\
+                 top_logprobs = 0"
+            )
+            .contains("top_logprobs")
+        );
+        assert!(error_of("[[backend]]\nname = \"t\"\nmodels = [\"a*b\"]").contains("`*`"));
+        assert!(error_of("[[backend]]\nname = \"t\"\nmodels = []").contains("at least one"));
+        assert!(error_of("[[backend]]\nname = \"t\"\napi_key_env = \"\"").contains("api_key_env"));
+        assert!(
+            error_of("[[backend]]\nname = \"t\"\nprotocol = \"grpc\"").contains("unknown variant")
+        );
     }
 }

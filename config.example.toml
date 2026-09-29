@@ -1,9 +1,10 @@
-# systemone-gateway configuration. Every key below [server], [upstream] and
-# [coalescing] is optional and shows its default value.
+# systemone-gateway configuration. Every key below [server] and [coalescing]
+# is optional and shows its default value, and so is every [[backend]] key
+# except name (and base_url for a chat backend).
 #
 # The file holds no secret: services are identified by the SHA-256 of their
-# key, and the TypeSafe key comes from the environment variable named in
-# upstream.api_key_env.
+# key, and each backend's key comes from the environment variable named in
+# its api_key_env.
 
 [server]
 listen = "0.0.0.0:8080"        # POST /v1/systemone, GET /v1/models
@@ -12,11 +13,19 @@ request_timeout_ms = 9000      # under the TypeSafe SDKs' 10 s default timeout
 max_body_bytes = 2097152
 log_format = "text"            # or "json"
 
-[upstream]
+# Backends answer the calls. A call goes to the backend whose `models` match
+# its "model" most closely: an exact name first, then the longest prefix
+# ending in `*`. With no [[backend]] at all, every model goes to TypeSafe
+# with its key in TYPESAFE_API_KEY.
+
+[[backend]]
+name = "typesafe"
+protocol = "systemone"         # POST /v1/systemone: TypeSafe, or any server with the same API
 base_url = "https://api.typesafe.ai"
-api_key_env = "TYPESAFE_API_KEY"
-# The account's limits, shared by every service below. If you run N replicas,
-# give each one 1/N of the account's limits.
+api_key_env = "TYPESAFE_API_KEY"   # leave out to send no key
+models = ["jev-*"]
+# The backend's limits, shared by every service below. If you run N replicas,
+# give each one 1/N of them.
 requests_per_minute = 1200
 # burst = 20                   # defaults to one second's worth of requests
 tokens_per_second = 250000
@@ -29,6 +38,24 @@ backoff_max_ms = 3000
 max_queue_wait_ms = 2000       # wait for capacity allowed on top of the merge window;
                                # past it, callers get 429 + retry-after
 models_cache_ttl_ms = 300000
+
+# A model hosted on Hugging Face, through the Inference Providers router.
+# Services ask for it by its Hugging Face id, such as "Qwen/Qwen2.5-7B-Instruct"
+# (append ":provider" to pin a provider). Each question becomes one chat call
+# that asks for a single token; the answer is read from its logprobs.
+[[backend]]
+name = "huggingface"
+protocol = "chat"
+base_url = "https://router.huggingface.co/v1"  # or an Inference Endpoint, TGI or vLLM: ".../v1"
+api_key_env = "HF_TOKEN"
+models = ["Qwen/*", "meta-llama/*"]
+# upstream_model = "Qwen/Qwen2.5-7B-Instruct"  # send this id whatever the service asked for
+top_logprobs = 5               # the router's maximum; vLLM and TGI accept up to 20
+requests_per_minute = 300      # one chat call per question counts here
+max_queue_wait_ms = 2000
+# Extra fields for every chat request. The gateway's own fields win.
+# [backend.request_extras]
+# chat_template_kwargs = { enable_thinking = false }
 
 [coalescing]
 window_ms = 10                 # 0 turns merging off

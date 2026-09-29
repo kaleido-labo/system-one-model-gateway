@@ -262,7 +262,7 @@ async fn a_429_from_typesafe_is_retried_after_retry_after_ms() {
     assert!(
         h.metrics()
             .await
-            .contains("systemone_gateway_upstream_retries_total 1")
+            .contains(r#"systemone_gateway_upstream_retries_total{backend="typesafe"} 1"#)
     );
 }
 
@@ -471,7 +471,7 @@ async fn metrics_account_per_service_and_per_upstream_call() {
         r#"systemone_gateway_calls_total{service="-",status="401"} 1"#,
         r#"systemone_gateway_questions_total{service="ocr"} 2"#,
         r#"systemone_gateway_questions_total{service="fraud"} 1"#,
-        r#"systemone_gateway_upstream_calls_total{status="200"} 1"#,
+        r#"systemone_gateway_upstream_calls_total{backend="typesafe",status="200"} 1"#,
         "systemone_gateway_batch_callers_sum 2.0",
         "systemone_gateway_batch_callers_count 1",
     ] {
@@ -480,10 +480,10 @@ async fn metrics_account_per_service_and_per_upstream_call() {
     let ocr_tokens = ocr.body["usage"]["input_tokens"].as_u64().unwrap();
     let fraud_tokens = fraud.body["usage"]["input_tokens"].as_u64().unwrap();
     assert!(metrics.contains(&format!(
-        r#"systemone_gateway_input_tokens_total{{service="ocr"}} {ocr_tokens}"#
+        r#"systemone_gateway_input_tokens_total{{service="ocr",backend="typesafe"}} {ocr_tokens}"#
     )));
     assert!(metrics.contains(&format!(
-        r#"systemone_gateway_input_tokens_total{{service="fraud"}} {fraud_tokens}"#
+        r#"systemone_gateway_input_tokens_total{{service="fraud",backend="typesafe"}} {fraud_tokens}"#
     )));
 }
 

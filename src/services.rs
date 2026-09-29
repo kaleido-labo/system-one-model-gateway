@@ -1,6 +1,6 @@
 //! The services allowed to call the gateway, and what each one may use.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,12 +12,13 @@ use tokio::time::Instant;
 
 use crate::config::ServiceConfig;
 use crate::limiter::Gcra;
+use crate::pattern::{ModelPattern, best_match, parse_all};
 
 pub type ServiceId = usize;
 
 pub struct Service {
     pub name: String,
-    allowed_models: Option<HashSet<String>>,
+    allowed_models: Option<Vec<ModelPattern>>,
     rate: Option<Gcra>,
     in_flight: Option<Arc<Semaphore>>,
 }
@@ -43,7 +44,7 @@ impl Service {
             allowed_models: config
                 .allowed_models
                 .as_ref()
-                .map(|models| models.iter().cloned().collect()),
+                .map(|models| parse_all(models)),
             rate: config
                 .requests_per_minute
                 .zip(config.burst())
@@ -55,7 +56,7 @@ impl Service {
     pub fn allows_model(&self, model: &str) -> bool {
         self.allowed_models
             .as_ref()
-            .is_none_or(|models| models.contains(model))
+            .is_none_or(|models| best_match(models, model).is_some())
     }
 
     pub fn admit(&self, now: Instant) -> Result<Admission, Refusal> {
@@ -188,6 +189,12 @@ mod tests {
         assert!(registry.get(0).allows_model("jev-latest"));
         assert!(!registry.get(0).allows_model("jev-preview"));
         assert!(registry.get(1).allows_model("anything"));
+
+        let mut family = config("c", "m");
+        family.allowed_models = Some(vec!["Qwen/*".to_owned()]);
+        let registry = ServiceRegistry::from_config(&[family]);
+        assert!(registry.get(0).allows_model("Qwen/Qwen2.5-7B-Instruct"));
+        assert!(!registry.get(0).allows_model("jev-latest"));
     }
 
     #[test]

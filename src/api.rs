@@ -1,4 +1,7 @@
 //! HTTP handlers: the TypeSafe-compatible public API and the admin endpoints.
+//!
+//! Whatever backend answers, services see TypeSafe's API: the same request,
+//! the same answers, the same errors.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,39 +14,39 @@ use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use tokio::sync::{Mutex, oneshot};
-use tokio::time::{Instant, sleep_until, timeout_at};
+use tokio::sync::oneshot;
+use tokio::time::{Instant, timeout_at};
 use tower_http::LatencyUnit;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::{Level, Span};
 
-use crate::coalescer::{Coalescer, Saturated};
+use crate::backend::Backends;
+use crate::coalescer::Saturated;
 use crate::dispatch::Outcome;
 use crate::error::{GatewayError, insert_retry_after};
 use crate::metrics::{CallLabels, Metrics};
 use crate::protocol::{PreparedRequest, RequestError};
 use crate::services::{Refusal, ServiceId, ServiceRegistry};
 use crate::tokens::TokenEstimator;
-use crate::upstream::{REQUEST_ID, Upstream};
+use crate::upstream::REQUEST_ID;
+use crate::validate::Invalid;
 
 /// How many calls shared the upstream call that answered this one.
 pub const BATCH_CALLERS: HeaderName = HeaderName::from_static("x-systemone-gateway-batch-callers");
+/// The backend that answered.
+pub const BACKEND: HeaderName = HeaderName::from_static("x-systemone-gateway-backend");
 
 #[derive(Clone)]
 pub struct AppState(Arc<Shared>);
 
 pub struct Shared {
     pub registry: ServiceRegistry,
-    pub coalescer: Arc<Coalescer>,
-    pub upstream: Arc<Upstream>,
+    pub backends: Backends,
     pub metrics: Arc<Metrics>,
     pub estimator: TokenEstimator,
     pub request_timeout: Duration,
-    pub max_queue_wait: Duration,
-    pub models_ttl: Duration,
-    pub models_cache: Mutex<Option<(Instant, Bytes)>>,
     pub ready: AtomicBool,
 }
 
@@ -134,6 +137,19 @@ async fn handle_systemone(
     if !service.allows_model(&request.model) {
         return GatewayError::model_not_allowed(&request.model).into_response();
     }
+    let Some(backend) = state.backends.route(&request.model) else {
+        return GatewayError::invalid(Invalid::new(
+            "model",
+            format!(
+                "{:?} is not served by any backend of this gateway",
+                request.model
+            ),
+        ))
+        .into_response();
+    };
+    if let Err(invalid) = backend.check(&request) {
+        return GatewayError::invalid(invalid).into_response();
+    }
     // Held until the answer is sent, so max_concurrent counts in-flight calls.
     let _admission = match service.admit(arrived) {
         Ok(admission) => admission,
@@ -160,10 +176,13 @@ async fn handle_systemone(
     let deadline = arrived + state.request_timeout;
     let (reply, answer) = oneshot::channel();
     if let Err(Saturated { retry_after }) =
-        state.coalescer.submit(request, arrived, deadline, reply)
+        backend.coalescer.submit(request, arrived, deadline, reply)
     {
         return GatewayError::rate_limited(
-            "the shared TypeSafe quota is booked beyond max_queue_wait_ms; retry later",
+            format!(
+                "backend {:?}'s shared quota is booked beyond max_queue_wait_ms; retry later",
+                backend.name
+            ),
             retry_after,
         )
         .into_response();
@@ -175,7 +194,13 @@ async fn handle_systemone(
         .inc_by(questions);
 
     match timeout_at(deadline, answer).await {
-        Ok(Ok(outcome)) => outcome_response(state, &service.name, outcome),
+        Ok(Ok(outcome)) => {
+            let mut response = outcome_response(state, &service.name, &backend.name, outcome);
+            if let Ok(value) = HeaderValue::from_str(&backend.name) {
+                response.headers_mut().insert(BACKEND, value);
+            }
+            response
+        }
         Ok(Err(_)) => {
             GatewayError::internal("the batch carrying this call was dropped").into_response()
         }
@@ -187,7 +212,7 @@ async fn handle_systemone(
     }
 }
 
-fn outcome_response(state: &Shared, service: &str, outcome: Outcome) -> Response {
+fn outcome_response(state: &Shared, service: &str, backend: &str, outcome: Outcome) -> Response {
     match outcome {
         Outcome::Answered {
             body,
@@ -199,7 +224,7 @@ fn outcome_response(state: &Shared, service: &str, outcome: Outcome) -> Response
                 state
                     .metrics
                     .input_tokens
-                    .get_or_create(&Metrics::service(service))
+                    .get_or_create(&Metrics::tokens(service, backend))
                     .inc_by(tokens);
             }
             let mut headers = json_headers(request_id.as_deref());
@@ -245,46 +270,33 @@ fn record_call(metrics: &Metrics, service: &str, status: StatusCode, arrived: In
         .observe(arrived.elapsed().as_secs_f64());
 }
 
-/// `GET /v1/models`, served from memory for `models_cache_ttl_ms`: the list
-/// rarely changes and every upstream call counts against the shared quota.
+/// `GET /v1/models`: the models of every backend, in configuration order.
+/// A System One backend's own list is served from memory for
+/// `models_cache_ttl_ms`; a chat backend lists the exact names it serves.
 async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let state = &state.0;
     if state.registry.authenticate(&headers).is_none() {
         return GatewayError::unauthorized().into_response();
     }
-    let now = Instant::now();
-    if let Some((fetched, body)) = state.models_cache.lock().await.as_ref()
-        && now.saturating_duration_since(*fetched) < state.models_ttl
-    {
-        return (StatusCode::OK, json_headers(None), body.clone()).into_response();
-    }
-    let slot = match state
-        .coalescer
-        .pacer()
-        .try_book(now, 1, state.max_queue_wait)
-    {
-        Ok(slot) => slot,
-        Err(retry_after) => {
-            return GatewayError::rate_limited(
-                "the shared TypeSafe quota is fully booked",
-                retry_after,
-            )
-            .into_response();
+    let deadline = Instant::now() + state.request_timeout;
+    let mut entries = Vec::new();
+    for backend in state.backends.iter() {
+        match backend.list_models(deadline).await {
+            Ok(list) => entries.extend(list),
+            Err(outcome) => return outcome_response(state, "-", &backend.name, outcome),
         }
-    };
-    sleep_until(slot).await;
-    match state.upstream.models(now + state.request_timeout).await {
-        Ok(reply) => {
-            *state.models_cache.lock().await = Some((Instant::now(), reply.body.clone()));
-            (
-                StatusCode::OK,
-                json_headers(reply.request_id.as_deref()),
-                reply.body,
-            )
-                .into_response()
-        }
-        Err(failure) => outcome_response(state, "-", Outcome::from_failure(&failure)),
     }
+    let mut list = String::from("[");
+    for (index, entry) in entries.iter().enumerate() {
+        if index > 0 {
+            list.push(',');
+        }
+        list.push_str(entry.get());
+    }
+    list.push(']');
+    let mut body = crate::json::ObjectWriter::with_capacity(list.len() + 12);
+    body.field("models", &list);
+    (StatusCode::OK, json_headers(None), body.finish()).into_response()
 }
 
 async fn not_found(method: Method, uri: Uri) -> Response {

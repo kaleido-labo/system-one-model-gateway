@@ -136,9 +136,8 @@ impl Coalescer {
         }
     }
 
-    /// The shared upstream request pacer.
-    pub fn pacer(&self) -> &crate::limiter::Gcra {
-        self.dispatcher.pacer()
+    pub fn engine(&self) -> &crate::backend::Engine {
+        self.dispatcher.engine()
     }
 
     /// Queues a call that arrived at `arrived`. Its outcome is sent on `reply`.
@@ -288,6 +287,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::Engine;
     use crate::limiter::Gcra;
     use crate::metrics::Metrics;
     use crate::tokens::TokenEstimator;
@@ -339,8 +339,9 @@ mod tests {
         let pacer = Arc::new(Gcra::per_minute(upstream_rpm, 1));
         // Nothing listens on port 9; the batches below are never sent.
         let upstream = Upstream::new(
+            "test",
             "http://127.0.0.1:9",
-            ApiKey::new("test"),
+            Some(ApiKey::new("test")),
             Duration::from_millis(100),
             RetryPolicy {
                 max_retries: 0,
@@ -352,8 +353,14 @@ mod tests {
             Arc::clone(&metrics),
         )
         .unwrap();
+        let upstream = Arc::new(upstream);
+        let engine = Engine::SystemOne {
+            url: upstream.endpoint("v1/systemone").unwrap(),
+            upstream,
+        };
         let dispatcher = Dispatcher::new(
-            Arc::new(upstream),
+            "test",
+            engine,
             pacer,
             Gcra::per_second(1_000_000.0, 1_000_000),
             4,

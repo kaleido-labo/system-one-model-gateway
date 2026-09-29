@@ -1,14 +1,17 @@
 use std::io::{BufRead, IsTerminal};
 use std::path::PathBuf;
 
-use anyhow::{Context, ensure};
+use anyhow::ensure;
 use clap::{Parser, Subcommand};
-use systemone_gateway::{ApiKey, Config, Gateway, LogFormat, generate_key, hash_key};
+use systemone_gateway::{Config, Gateway, LogFormat, Protocol, generate_key, hash_key};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(version, about = "One gateway in front of TypeSafe's System One API")]
+#[command(
+    version,
+    about = "One System One API in front of TypeSafe, Hugging Face and other model backends"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -52,13 +55,7 @@ async fn main() -> anyhow::Result<()> {
 async fn serve(path: PathBuf) -> anyhow::Result<()> {
     let config = Config::load(&path)?;
     init_logging(config.server.log_format);
-    let variable = &config.upstream.api_key_env;
-    let api_key = std::env::var(variable).with_context(|| {
-        format!("the TypeSafe API key must be in the {variable} environment variable")
-    })?;
-    ensure!(!api_key.trim().is_empty(), "{variable} is empty");
-
-    let gateway = Gateway::start(&config, ApiKey::new(api_key.trim())).await?;
+    let gateway = Gateway::start(&config, |variable| std::env::var(variable).ok()).await?;
     shutdown_signal().await;
     info!("shutting down; letting in-flight calls finish");
     gateway.shutdown().await
@@ -67,13 +64,25 @@ async fn serve(path: PathBuf) -> anyhow::Result<()> {
 fn check_config(path: PathBuf) -> anyhow::Result<()> {
     let config = Config::load(&path)?;
     println!("{} is valid.", path.display());
-    println!(
-        "upstream: {} ({} requests/min, {} tokens/s, key from ${})",
-        config.upstream.base_url,
-        config.upstream.requests_per_minute,
-        config.upstream.tokens_per_second,
-        config.upstream.api_key_env
-    );
+    for backend in &config.backends {
+        let protocol = match backend.protocol {
+            Protocol::Systemone => "System One",
+            Protocol::Chat => "chat with logprobs",
+        };
+        let key = backend
+            .api_key_env
+            .as_ref()
+            .map_or("no key".to_owned(), |variable| {
+                format!("key from ${variable}")
+            });
+        println!(
+            "backend {}: {protocol} at {} for {}, {} requests/min, {key}",
+            backend.name,
+            backend.base_url(),
+            backend.models.join(", "),
+            backend.requests_per_minute,
+        );
+    }
     match config.coalescing.window_ms {
         0 => println!("merging: off"),
         window => println!("merging: calls sharing a state within {window} ms go out together"),

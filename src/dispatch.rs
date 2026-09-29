@@ -11,12 +11,13 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::{Instant, sleep_until, timeout_at};
 use tracing::{debug, error, warn};
 
+use crate::backend::Engine;
 use crate::batch::{Plan, SplitError};
 use crate::error::GatewayError;
 use crate::limiter::Gcra;
 use crate::metrics::Metrics;
 use crate::protocol::{PreparedRequest, input_tokens};
-use crate::upstream::{Upstream, UpstreamFailure, describe};
+use crate::upstream::{UpstreamFailure, describe};
 
 /// Shortest retry-after the gateway suggests when it sheds a call.
 pub const MIN_RETRY_AFTER: Duration = Duration::from_millis(500);
@@ -26,7 +27,7 @@ type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 /// One service call waiting for its answer.
 pub struct Member {
     pub request: PreparedRequest,
-    /// Latest instant the call may still leave for TypeSafe. Past it, the
+    /// Latest instant the call may still leave for its backend. Past it, the
     /// caller is better served by a 429 and a retry-after than by a late send
     /// that burns tokens on an answer it may no longer wait for.
     pub latest_send: Instant,
@@ -46,7 +47,7 @@ pub enum Outcome {
     },
     /// An error the gateway answers itself.
     Failed(GatewayError),
-    /// An error status from TypeSafe, handed back as the vendor sent it.
+    /// An error status from the backend, handed back as it was sent.
     Rejected {
         status: StatusCode,
         body: Bytes,
@@ -56,15 +57,15 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    pub fn from_failure(failure: &UpstreamFailure) -> Self {
+    pub fn from_failure(backend: &str, failure: &UpstreamFailure) -> Self {
         match failure {
             UpstreamFailure::Status { status, .. } if *status == StatusCode::UNAUTHORIZED => {
                 // The caller's key was fine; the gateway's own key is not.
                 // Passing the 401 through would send the service chasing a
                 // problem it does not have.
-                Self::Failed(GatewayError::upstream(
-                    "TypeSafe refused the gateway's API key; the gateway's operator has to fix it",
-                ))
+                Self::Failed(GatewayError::upstream(format!(
+                    "backend {backend:?} refused the gateway's API key; the gateway's operator has to fix it"
+                )))
             }
             UpstreamFailure::Status {
                 status,
@@ -79,23 +80,30 @@ impl Outcome {
             },
             UpstreamFailure::Transport {
                 timed_out: true, ..
-            } => Self::Failed(GatewayError::timeout("TypeSafe did not answer in time")),
+            } => Self::Failed(GatewayError::timeout(format!(
+                "backend {backend:?} did not answer in time"
+            ))),
             UpstreamFailure::Transport { detail, .. } => Self::Failed(GatewayError::upstream(
-                format!("could not reach TypeSafe: {detail}"),
+                format!("could not reach backend {backend:?}: {detail}"),
             )),
             UpstreamFailure::Paused { retry_after } => Self::Failed(GatewayError::rate_limited(
-                "TypeSafe asked the gateway to slow down",
+                format!("backend {backend:?} is over its limit for now"),
                 *retry_after,
             )),
-            UpstreamFailure::Deadline => Self::Failed(GatewayError::timeout(
-                "the call's deadline passed before TypeSafe could be reached",
-            )),
+            UpstreamFailure::Deadline => Self::Failed(GatewayError::timeout(format!(
+                "the call's deadline passed before backend {backend:?} could be reached"
+            ))),
+            UpstreamFailure::Unreadable(reason) => Self::Failed(GatewayError::upstream(format!(
+                "backend {backend:?} answered something the gateway cannot read: {reason}"
+            ))),
         }
     }
 }
 
 pub struct Dispatcher {
-    upstream: Arc<Upstream>,
+    /// The backend's name, for messages and logs.
+    backend: String,
+    engine: Engine,
     /// Upstream requests per minute, shared by every service.
     pacer: Arc<Gcra>,
     /// Upstream tokens per second, booked on estimates.
@@ -108,14 +116,16 @@ pub struct Dispatcher {
 
 impl Dispatcher {
     pub fn new(
-        upstream: Arc<Upstream>,
+        backend: &str,
+        engine: Engine,
         pacer: Arc<Gcra>,
         token_pacer: Gcra,
         max_concurrency: usize,
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
-            upstream,
+            backend: backend.to_owned(),
+            engine,
             pacer,
             token_pacer,
             permits: Arc::new(Semaphore::new(max_concurrency)),
@@ -125,6 +135,10 @@ impl Dispatcher {
 
     pub fn pacer(&self) -> &Gcra {
         &self.pacer
+    }
+
+    pub fn engine(&self) -> &Engine {
+        &self.engine
     }
 
     /// Waits for a free upstream slot.
@@ -159,7 +173,7 @@ impl Dispatcher {
         let mut plan = Plan::new(&live.iter().map(|m| &m.request).collect::<Vec<_>>());
 
         // Tokens per second, booked on the estimate and corrected with the
-        // real count once TypeSafe answers. The batch waits for the budget
+        // real count once the backend answers. The batch waits for the budget
         // only as long as its most patient caller allows.
         let now = Instant::now();
         let most_patient = live
@@ -217,9 +231,11 @@ impl Dispatcher {
         self.metrics
             .deduplicated_questions
             .inc_by(plan.deduplicated as u64);
-        self.metrics.estimated_tokens_saved.inc_by(u64::from(
-            plan.standalone_tokens.saturating_sub(plan.estimated_tokens),
-        ));
+        if self.engine.sends_state_once() {
+            self.metrics.estimated_tokens_saved.inc_by(u64::from(
+                plan.standalone_tokens.saturating_sub(plan.estimated_tokens),
+            ));
+        }
 
         // Serve the most patient caller: callers whose deadline passes first
         // get their 504 from the HTTP handler, the others still get answers.
@@ -229,7 +245,7 @@ impl Dispatcher {
             .max()
             .expect("at least one live member");
         let sent = Instant::now();
-        let result = self.upstream.systemone(plan.body.clone(), deadline).await;
+        let result = self.engine.execute(plan.body.clone(), deadline).await;
         drop(permit);
 
         match result {
@@ -240,12 +256,13 @@ impl Dispatcher {
                         .adjust(actual - i64::from(plan.estimated_tokens));
                 }
                 debug!(
+                    backend = %self.backend,
                     callers = plan.callers,
                     questions = plan.questions,
                     deduplicated = plan.deduplicated,
                     upstream_ms = sent.elapsed().as_millis() as u64,
                     request_id = reply.request_id.as_deref().unwrap_or("-"),
-                    "TypeSafe call answered"
+                    "upstream call answered"
                 );
                 for (member, answer) in live.into_iter().zip(plan.split(&reply.body)) {
                     let outcome = match answer {
@@ -256,14 +273,16 @@ impl Dispatcher {
                             batch_callers: plan.callers,
                         },
                         Err(err) => {
-                            error!(error = ?err, "TypeSafe's answer could not be split");
+                            error!(backend = %self.backend, error = ?err, "the answer could not be split");
                             Outcome::Failed(GatewayError::upstream(match err {
-                                SplitError::Unreadable(reason) => {
-                                    format!("TypeSafe's response could not be read: {reason}")
-                                }
-                                SplitError::MissingAnswer(id) => {
-                                    format!("TypeSafe's response has no answer for question {id:?}")
-                                }
+                                SplitError::Unreadable(reason) => format!(
+                                    "backend {:?}'s response could not be read: {reason}",
+                                    self.backend
+                                ),
+                                SplitError::MissingAnswer(id) => format!(
+                                    "backend {:?}'s response has no answer for question {id:?}",
+                                    self.backend
+                                ),
                             }))
                         }
                     };
@@ -282,9 +301,10 @@ impl Dispatcher {
                 // requests, and the error then reaches only the caller whose
                 // question caused it.
                 warn!(
+                    backend = %self.backend,
                     callers = live.len(),
                     status = status.as_u16(),
-                    "TypeSafe rejected a merged call; replaying each call on its own"
+                    "the backend rejected a merged call; replaying each call on its own"
                 );
                 self.metrics.isolated_replays.inc_by(live.len() as u64);
                 for member in live {
@@ -296,13 +316,18 @@ impl Dispatcher {
                     UpstreamFailure::Status { status, .. }
                         if *status == StatusCode::UNAUTHORIZED =>
                     {
-                        error!("TypeSafe refused the gateway's API key");
+                        error!(backend = %self.backend, "the backend refused the gateway's API key");
                     }
                     _ => {
-                        warn!(callers = live.len(), failure = %describe(&failure), "TypeSafe call failed")
+                        warn!(
+                            backend = %self.backend,
+                            callers = live.len(),
+                            failure = %describe(&failure),
+                            "upstream call failed"
+                        )
                     }
                 }
-                let outcome = Outcome::from_failure(&failure);
+                let outcome = Outcome::from_failure(&self.backend, &failure);
                 for member in live {
                     let _ = member.reply.send(outcome.clone());
                 }
@@ -324,7 +349,7 @@ impl Dispatcher {
                 let _ = member
                     .reply
                     .send(Outcome::Failed(GatewayError::rate_limited(
-                        "the shared TypeSafe quota is booked past this call's deadline",
+                        "the backend's shared quota is booked past this call's deadline",
                         start.saturating_duration_since(now),
                     )));
                 return;

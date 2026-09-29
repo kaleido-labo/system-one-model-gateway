@@ -1,5 +1,8 @@
 //! A gateway wired to a mock TypeSafe, for the integration tests.
 
+// Each test binary compiles this module and uses a different part of it.
+#![allow(dead_code)]
+
 pub mod mock_upstream;
 
 use std::borrow::Borrow;
@@ -7,7 +10,7 @@ use std::borrow::Borrow;
 use axum::http::HeaderMap;
 use reqwest::StatusCode;
 use serde_json::Value;
-use systemone_gateway::{ApiKey, Config, Gateway, hash_key};
+use systemone_gateway::{Config, Gateway, hash_key};
 
 pub use mock_upstream::{MockUpstream, Scripted};
 
@@ -17,11 +20,15 @@ pub const UPSTREAM_KEY: &str = "upstream-secret";
 /// Extra TOML lines for each configuration table, and the services.
 pub struct Setup {
     pub server: &'static str,
+    /// Extra lines for the System One backend, which serves `jev-*`.
     pub upstream: &'static str,
+    /// Extra lines for a chat backend on the same mock, serving `Qwen/*`.
+    /// `None` leaves the chat backend out.
+    pub chat: Option<&'static str>,
     pub coalescing: &'static str,
     /// (name, key, extra lines for its [[service]] block)
     pub services: Vec<(&'static str, &'static str, &'static str)>,
-    /// The TypeSafe key the gateway presents to the mock.
+    /// The key the gateway presents to the mock, on both backends.
     pub gateway_key: &'static str,
 }
 
@@ -30,6 +37,7 @@ impl Default for Setup {
         Self {
             server: "",
             upstream: "",
+            chat: None,
             // Wide enough that calls fired together always land in one batch.
             coalescing: "window_ms = 150",
             services: vec![
@@ -71,10 +79,20 @@ impl Harness {
         let mock = MockUpstream::start("127.0.0.1:0".parse().unwrap(), UPSTREAM_KEY).await;
         let mut toml = format!(
             "[server]\nlisten = \"127.0.0.1:0\"\nadmin_listen = \"127.0.0.1:0\"\n{}\n\
-             [upstream]\nbase_url = \"{}\"\nbackoff_initial_ms = 20\nbackoff_max_ms = 100\n{}\n\
-             [coalescing]\n{}\n",
-            setup.server, mock.url, setup.upstream, setup.coalescing
+             [[backend]]\nname = \"typesafe\"\nbase_url = \"{}\"\napi_key_env = \"MOCK_KEY\"\n\
+             models = [\"jev-*\"]\nbackoff_initial_ms = 20\nbackoff_max_ms = 100\n{}\n",
+            setup.server, mock.url, setup.upstream
         );
+        if let Some(chat) = setup.chat {
+            toml.push_str(&format!(
+                "[[backend]]\nname = \"hf\"\nprotocol = \"chat\"\nbase_url = \"{}/v1\"\n\
+                 api_key_env = \"MOCK_KEY\"\n{}backoff_initial_ms = 20\nbackoff_max_ms = 100\n{chat}\n",
+                mock.url,
+                // A test may list its own models.
+                if chat.contains("models =") { "" } else { "models = [\"Qwen/*\"]\n" },
+            ));
+        }
+        toml.push_str(&format!("[coalescing]\n{}\n", setup.coalescing));
         for (name, key, extra) in &setup.services {
             toml.push_str(&format!(
                 "[[service]]\nname = \"{name}\"\nkey_sha256 = [\"{}\"]\n{extra}\n",
@@ -82,9 +100,12 @@ impl Harness {
             ));
         }
         let config = Config::from_toml(&toml).expect("the test configuration is valid");
-        let gateway = Gateway::start(&config, ApiKey::new(setup.gateway_key))
-            .await
-            .unwrap();
+        let key = setup.gateway_key;
+        let gateway = Gateway::start(&config, move |variable| {
+            (variable == "MOCK_KEY").then(|| key.to_owned())
+        })
+        .await
+        .unwrap();
         Self {
             mock,
             gateway,

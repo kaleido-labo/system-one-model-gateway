@@ -19,9 +19,21 @@ pub struct ServiceLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub struct StatusLabels {
-    /// HTTP status, or 0 when the vendor could not be reached.
+pub struct BackendLabels {
+    pub backend: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct UpstreamLabels {
+    pub backend: String,
+    /// HTTP status, or 0 when the backend could not be reached.
     pub status: u16,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct TokenLabels {
+    pub service: String,
+    pub backend: String,
 }
 
 type HistogramFamily<L> = Family<L, Histogram, fn() -> Histogram>;
@@ -31,10 +43,10 @@ pub struct Metrics {
     pub calls: Family<CallLabels, Counter>,
     pub call_duration: HistogramFamily<ServiceLabels>,
     pub questions: Family<ServiceLabels, Counter>,
-    pub input_tokens: Family<ServiceLabels, Counter>,
-    pub upstream_calls: Family<StatusLabels, Counter>,
-    pub upstream_duration: Histogram,
-    pub upstream_retries: Counter,
+    pub input_tokens: Family<TokenLabels, Counter>,
+    pub upstream_calls: Family<UpstreamLabels, Counter>,
+    pub upstream_duration: HistogramFamily<BackendLabels>,
+    pub upstream_retries: Family<BackendLabels, Counter>,
     pub batch_callers: Histogram,
     pub batch_questions: Histogram,
     pub deduplicated_questions: Counter,
@@ -71,25 +83,26 @@ impl Metrics {
             "Questions asked by each service",
             questions.clone(),
         );
-        let input_tokens = Family::<ServiceLabels, Counter>::default();
+        let input_tokens = Family::<TokenLabels, Counter>::default();
         registry.register(
             "input_tokens",
-            "Upstream input tokens charged to each service; merged calls are split between their callers",
+            "Upstream input tokens charged to each service, by backend; merged calls are split between their callers",
             input_tokens.clone(),
         );
-        let upstream_calls = Family::<StatusLabels, Counter>::default();
+        let upstream_calls = Family::<UpstreamLabels, Counter>::default();
         registry.register(
             "upstream_calls",
-            "Calls made to TypeSafe, by final status after retries",
+            "HTTP calls made to each backend, by final status after retries",
             upstream_calls.clone(),
         );
-        let upstream_duration = latency_histogram();
+        let upstream_duration: HistogramFamily<BackendLabels> =
+            Family::new_with_constructor(latency_histogram);
         registry.register(
             "upstream_duration_seconds",
-            "Time spent in TypeSafe calls, retries included",
+            "Time spent in each backend's HTTP calls, retries included",
             upstream_duration.clone(),
         );
-        let upstream_retries = Counter::default();
+        let upstream_retries = Family::<BackendLabels, Counter>::default();
         registry.register(
             "upstream_retries",
             "Upstream attempts retried after a 429, 529, 5xx or network error",
@@ -98,13 +111,13 @@ impl Metrics {
         let batch_callers = Histogram::new([1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 32.0, 64.0]);
         registry.register(
             "batch_callers",
-            "Service calls answered by one upstream call",
+            "Service calls answered by one merged batch",
             batch_callers.clone(),
         );
         let batch_questions = Histogram::new(exponential_buckets(1.0, 2.0, 9));
         registry.register(
             "batch_questions",
-            "Distinct questions sent in one upstream call",
+            "Distinct questions sent in one merged batch",
             batch_questions.clone(),
         );
         let deduplicated_questions = Counter::default();
@@ -116,7 +129,7 @@ impl Metrics {
         let estimated_tokens_saved = Counter::default();
         registry.register(
             "estimated_tokens_saved",
-            "Estimated input tokens not billed because calls sharing a state were merged",
+            "Estimated input tokens not billed because calls sharing a state were merged (System One backends only)",
             estimated_tokens_saved.clone(),
         );
         let isolated_replays = Counter::default();
@@ -153,6 +166,19 @@ impl Metrics {
     pub fn service(name: &str) -> ServiceLabels {
         ServiceLabels {
             service: name.to_owned(),
+        }
+    }
+
+    pub fn backend(name: &str) -> BackendLabels {
+        BackendLabels {
+            backend: name.to_owned(),
+        }
+    }
+
+    pub fn tokens(service: &str, backend: &str) -> TokenLabels {
+        TokenLabels {
+            service: service.to_owned(),
+            backend: backend.to_owned(),
         }
     }
 
