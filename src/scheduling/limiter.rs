@@ -103,13 +103,12 @@ impl Limiter {
     }
 
     /// Changes the sustained rate from now on, keeping what is already
-    /// booked. Nothing calls it yet; it is here for the adaptive rate that
-    /// will raise and lower a backend's limit while the gateway runs.
+    /// booked. The adaptive rate calls it to raise and lower a backend's
+    /// limit while the gateway runs.
     ///
     /// A shared limiter applies the new rate to the bookings this replica
     /// makes. Redis holds times, not a rate, so replicas that disagree on the
     /// rate simply each book with their own.
-    #[allow(dead_code, reason = "for the adaptive rate, which lands separately")]
     pub fn set_rate(&self, per_second: f64) {
         match self {
             Self::Local(gcra) => gcra.set_rate(per_second),

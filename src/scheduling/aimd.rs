@@ -101,6 +101,7 @@ impl Aimd {
     }
 
     /// The current rate, in requests per minute.
+    #[cfg(test)]
     pub fn rate(&self) -> f64 {
         self.lock().rate
     }
