@@ -32,6 +32,8 @@ pub struct Config {
     pub backends: Vec<BackendConfig>,
     #[serde(default)]
     pub coalescing: CoalescingConfig,
+    #[serde(default)]
+    pub cache: CacheConfig,
     #[serde(default, rename = "service")]
     pub services: Vec<ServiceConfig>,
 }
@@ -95,6 +97,32 @@ impl Default for CoalescingConfig {
             max_request_tokens: 56_000,
             max_state_plus_question_tokens: 28_000,
             bytes_per_token: 3.0,
+        }
+    }
+}
+
+/// The in-memory answer cache. One table for every backend: the memory bound
+/// and the time to live are things an operator reasons about for the whole
+/// process, and a backend that must not be cached opts out with `cache = false`
+/// in its own block.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CacheConfig {
+    /// Off by default: a cached answer is a choice to trade freshness for
+    /// fewer upstream requests, and the operator makes it.
+    pub enabled: bool,
+    /// How long an answer may be served after it was received.
+    pub ttl_ms: u64,
+    /// Most answers held at once. When full, the oldest one makes room.
+    pub max_entries: usize,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ttl_ms: 300_000,
+            max_entries: 10_000,
         }
     }
 }
@@ -205,6 +233,12 @@ impl Config {
             "coalescing.max_state_plus_question_tokens must be positive"
         );
 
+        ensure!(self.cache.ttl_ms > 0, "cache.ttl_ms must be positive");
+        ensure!(
+            self.cache.max_entries > 0,
+            "cache.max_entries must be positive"
+        );
+
         if self.services.is_empty() {
             bail!("no [[service]] configured: nobody could call the gateway");
         }
@@ -286,6 +320,8 @@ mod tests {
         assert_eq!(backend.requests_per_minute, 1_200);
         assert_eq!(backend.burst(), 20);
         assert_eq!(config.coalescing.window_ms, 10);
+        assert!(!config.cache.enabled);
+        assert!(backend.cache);
         assert_eq!(config.server.listen.port(), 8080);
         assert_eq!(config.services[0].burst(), None);
     }
@@ -365,6 +401,32 @@ mod tests {
 
         let zero_rate = with_service("requests_per_minute = 0");
         assert!(Config::from_toml(&zero_rate).is_err());
+    }
+
+    #[test]
+    fn the_cache_is_off_until_the_file_turns_it_on() {
+        let config = Config::from_toml(&with_service("")).unwrap();
+        assert!(!config.cache.enabled);
+        assert_eq!(config.cache.ttl_ms, 300_000);
+        assert_eq!(config.cache.max_entries, 10_000);
+
+        let config = Config::from_toml(&format!(
+            "[cache]\nenabled = true\nttl_ms = 60000\nmax_entries = 50\n\
+             [[backend]]\nname = \"t\"\ncache = false\n{}",
+            with_service("")
+        ))
+        .unwrap();
+        assert!(config.cache.enabled);
+        assert_eq!(config.cache.ttl_ms, 60_000);
+        assert_eq!(config.cache.max_entries, 50);
+        assert!(!config.backends[0].cache);
+    }
+
+    #[test]
+    fn rejects_a_cache_that_cannot_hold_anything() {
+        assert!(error_of("[cache]\nttl_ms = 0").contains("cache.ttl_ms"));
+        assert!(error_of("[cache]\nmax_entries = 0").contains("cache.max_entries"));
+        assert!(error_of("[cache]\nttl = 5").contains("unknown field"));
     }
 
     fn error_of(toml: &str) -> String {

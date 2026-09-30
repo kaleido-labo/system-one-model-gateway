@@ -1,6 +1,7 @@
 //! `POST /v1/systemone`: authenticates the caller, validates the request,
 //! routes it to a backend, queues it for merging and turns the outcome into
-//! an HTTP response.
+//! an HTTP response. When the answer cache is on, a call may be answered from
+//! it, in whole or in part, before it reaches the batcher (`cached`).
 
 use std::time::Duration;
 
@@ -12,12 +13,16 @@ use tokio::sync::oneshot;
 use tokio::time::{Instant, timeout_at};
 use tracing::Span;
 
-use super::{AppState, BACKEND, Shared, outcome_response};
+use super::{AppState, BACKEND, CACHE, Shared, json_headers, outcome_response};
 use crate::error::GatewayError;
 use crate::metrics::{CallLabels, Metrics};
 use crate::scheduling::Saturated;
 use crate::services::{Refusal, ServiceId};
 use crate::wire::{Invalid, PreparedRequest, RequestError};
+
+mod cached;
+
+use cached::{Reuse, wants_fresh};
 
 pub(super) async fn systemone(
     State(state): State<AppState>,
@@ -31,7 +36,7 @@ pub(super) async fn systemone(
     };
     let service = state.0.registry.get(service_id);
     Span::current().record("service", service.name.as_str());
-    let response = handle_systemone(&state.0, service_id, &body, arrived).await;
+    let response = handle_systemone(&state.0, service_id, &headers, &body, arrived).await;
     record_call(&state.0.metrics, &service.name, response.status(), arrived);
     response
 }
@@ -39,11 +44,12 @@ pub(super) async fn systemone(
 async fn handle_systemone(
     state: &Shared,
     service_id: ServiceId,
+    headers: &HeaderMap,
     body: &[u8],
     arrived: Instant,
 ) -> Response {
     let service = state.registry.get(service_id);
-    let request = match PreparedRequest::parse(body, &state.estimator) {
+    let mut request = match PreparedRequest::parse(body, &state.estimator) {
         Ok(request) => request,
         Err(RequestError::Malformed(message)) => {
             return GatewayError::malformed(message).into_response();
@@ -91,6 +97,37 @@ async fn handle_systemone(
     };
 
     let questions = request.questions.len() as u64;
+    // Looked up only now: a call the service's limits refuse, or that is
+    // invalid, never reads the cache. A hit still spends one request of the
+    // service's budget, but nothing of the backend's.
+    let reuse = state
+        .cache
+        .as_ref()
+        .filter(|_| backend.cached)
+        .map(|cache| {
+            Reuse::lookup(
+                cache,
+                &state.metrics,
+                &backend.name,
+                &mut request,
+                wants_fresh(headers),
+                Instant::now(),
+            )
+        });
+    if let Some(reuse) = reuse.as_ref().filter(|reuse| reuse.is_complete()) {
+        state
+            .metrics
+            .questions
+            .get_or_create(&Metrics::service(&service.name))
+            .inc_by(questions);
+        let mut response_headers = json_headers(None);
+        response_headers.insert(CACHE, HeaderValue::from_static(reuse.label()));
+        if let Ok(value) = HeaderValue::from_str(&backend.name) {
+            response_headers.insert(BACKEND, value);
+        }
+        return (StatusCode::OK, response_headers, reuse.body()).into_response();
+    }
+
     let deadline = arrived + state.request_timeout;
     let (reply, answer) = oneshot::channel();
     if let Err(Saturated { retry_after }) =
@@ -113,9 +150,18 @@ async fn handle_systemone(
 
     match timeout_at(deadline, answer).await {
         Ok(Ok(outcome)) => {
+            let outcome = match &reuse {
+                Some(reuse) => reuse.absorb(outcome, Instant::now()),
+                None => outcome,
+            };
             let mut response = outcome_response(state, &service.name, &backend.name, outcome);
             if let Ok(value) = HeaderValue::from_str(&backend.name) {
                 response.headers_mut().insert(BACKEND, value);
+            }
+            if let Some(reuse) = reuse.filter(|_| response.status() == StatusCode::OK) {
+                response
+                    .headers_mut()
+                    .insert(CACHE, HeaderValue::from_static(reuse.label()));
             }
             response
         }

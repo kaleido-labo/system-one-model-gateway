@@ -11,6 +11,7 @@ use tokio::task::JoinSet;
 use tracing::info;
 
 use crate::backend::Backends;
+use crate::cache::AnswerCache;
 use crate::config::{Config, millis};
 use crate::http::{AppState, Shared, admin_router, public_router};
 use crate::metrics::Metrics;
@@ -97,11 +98,16 @@ impl Gateway {
 
 fn build_state(config: &Config, env: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<AppState> {
     let metrics = Arc::new(Metrics::new());
+    let cache = config
+        .cache
+        .enabled
+        .then(|| AnswerCache::new(&config.cache, metrics.cache_entries.clone()));
     Ok(AppState::new(Shared {
         registry: ServiceRegistry::from_config(&config.services),
         backends: Backends::build(config, env, &metrics)?,
         metrics,
         estimator: TokenEstimator::new(config.coalescing.bytes_per_token),
+        cache,
         request_timeout: millis(config.server.request_timeout_ms),
         ready: AtomicBool::new(false),
     }))
