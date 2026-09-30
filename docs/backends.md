@@ -9,6 +9,7 @@ answer comes back in TypeSafe's format either way.
 - [`protocol = "systemone"`](#protocol--systemone)
 - [`protocol = "chat"`](#protocol--chat)
 - [Choosing between them](#choosing-between-them)
+- [Fallback and the circuit breaker](#fallback-and-the-circuit-breaker)
 
 ## How a model picks a backend
 
@@ -207,3 +208,116 @@ deadline, the caller gets a 429 instead.
 | Choice options | Up to 255 | Up to 26, and at most `top_logprobs` visible |
 | Extra top-level fields | Forwarded | Dropped |
 | `GET /v1/models` | The provider's list, cached | The exact names in `models` |
+
+## Fallback and the circuit breaker
+
+A backend that is down makes every call to it wait through its retries and
+then fail. Two opt-in settings keep the services going: a circuit breaker per
+backend, which notices the outage, and a `fallback` list, which says where the
+calls can go meanwhile.
+
+### The circuit breaker
+
+Every backend has one. It counts upstream calls, not callers: a merged call that
+fails for ten services is one failed call.
+
+- **Closed.** Calls go through. A call that fails after its retries adds one to
+  a count, and an answer resets it to zero. A call fails when it ends in a
+  network error or a timeout, a 5xx (529 included), or a 401, which means the
+  backend refuses the gateway's own key. After `circuit_breaker_failures`
+  failures in a row (5 by default), the breaker opens.
+- **Open.** The gateway turns calls away without sending them, for
+  `circuit_breaker_cooldown_ms` (30 s by default).
+- **Half-open.** The first call that arrives after the cool-down is the trial.
+  The other calls keep being turned away until the trial ends. If the backend
+  answers it, the breaker closes. If the trial fails, the breaker opens again
+  for another cool-down.
+
+A 429 never trips the breaker. The backend answered, and the
+[pause after a 429](architecture.md#retries-and-backoff) already holds the
+traffic back. Nor do client errors (400, 403, 422): the call was at fault, not
+the backend. A call that never started (its deadline passed first) or whose
+answer could not be read says nothing either way.
+
+`circuit_breaker_failures = 0` turns the breaker off for a backend.
+
+### What a service sees
+
+- **With a fallback**, the call goes to the next usable backend (see below), and
+  the `x-systemone-gateway-backend` header names the backend that answered.
+- **Without one**, or when every fallback is turned away too, the call fails at
+  once with a `503` `unavailable_error`, with a `retry-after` equal to the time
+  left of the cool-down. It is not queued, and nothing is sent upstream.
+
+The breaker is per gateway process, like the pacing. With several replicas, each
+finds out about an outage on its own.
+
+### Fallback
+
+```toml
+[[backend]]
+name = "typesafe"
+api_key_env = "TYPESAFE_API_KEY"
+models = ["jev-*"]
+fallback = ["local-vllm"]
+
+[[backend]]
+name = "local-vllm"
+protocol = "chat"
+base_url = "http://vllm.internal:8000/v1"
+models = ["my-judge"]
+upstream_model = "org/fine-tuned-model"
+```
+
+A call for `jev-latest` goes to `typesafe`. If `typesafe` cannot take it, it goes
+to `local-vllm`. The first of these sends it to a fallback:
+
+1. The routed backend's breaker is open, or half-open with a trial under way.
+   The call goes straight to the fallback, without trying the backend.
+2. The call reached the routed backend and failed with an outage (a network
+   error or timeout, a 5xx, a 401) after its retries, and at least one second
+   is left before the call's deadline. The gateway then sends the call again to
+   the fallback. That is safe because a failed call returned nothing to the
+   caller, and a System One call changes nothing on the backend. A call that the
+   backend refused for its own faults (400, 403, 422), or that was rate limited
+   (429), is not sent again: another backend would not do better, and the caller
+   should see the error.
+
+Rules:
+
+- **Order.** The fallbacks are tried in the order of the list. A fallback's own
+  `fallback` list is followed right after it, and each backend is tried once.
+  A fallback whose breaker is open is skipped. A fallback that cannot express
+  the question, such as a Choice with more than 26 options for a chat backend,
+  is skipped too.
+- **Which model the fallback gets.** The request is passed on unchanged, so the
+  fallback receives the model name the service asked for. A chat backend with
+  `upstream_model` sends that id upstream whatever the name, so it can stand in
+  for any model. A backend without one sends the requested name as it is, so it
+  has to know it. The fallback does not have to list the model in its `models`:
+  that list only decides which backend a model routes to, and a model still
+  routes to one backend only.
+- **Service limits.** A service's `allowed_models` is checked once, on the model
+  it asked for, before routing. A fallback is never a way around it.
+- **Capacity.** The call takes a slot from the fallback's own limits, and waits
+  for its queue like any call. A 429 from the fallback is passed on.
+- **Validation.** `check-config` refuses a fallback that names a backend that
+  does not exist, names itself, lists a name twice, or leads back to a backend
+  already in the chain.
+
+The metric `fallback_calls_total{from, to}` counts the calls a fallback served,
+where `from` is the backend the model routes to, and `circuit_state{backend}`
+shows each breaker. See [Operations](operations.md#metrics).
+
+### Chat backends are not calibrated like Jev
+
+A chat backend as a fallback for a System One backend answers, but not the same
+way. Its probabilities are the model's raw token probabilities, not the ones
+TypeSafe calibrated for Jev, and its `confidence` and `noul` values do not mean
+the same thing (see the
+[limits of chat backends](#limits-compared-to-a-system-one-backend)). A service
+that applies thresholds tuned on Jev can make different decisions on a fallback
+answer. Measure a fallback on your own data before you rely on it, and watch
+`fallback_calls_total` so that you know when it happens. The `x-systemone-gateway-backend`
+header tells a service which backend answered, for a service that wants to
+treat those answers differently.

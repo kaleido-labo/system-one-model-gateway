@@ -100,6 +100,22 @@ max_queue_wait_ms = 2000
 # protocol = "systemone" only.
 models_cache_ttl_ms = 300000
 
+# Circuit breaker. After this many upstream calls in a row that fail (network
+# error, timeout, 5xx, 529, or a 401 for the gateway's key, each counted after
+# its retries), the breaker opens and calls are turned away for the cool-down,
+# in milliseconds. Then one trial call goes through: an answer closes the
+# breaker, a failure opens it again. A 429 or a client error does not count.
+# 0 turns the breaker off. Without a fallback, an open breaker answers 503 at
+# once, with a retry-after.
+circuit_breaker_failures = 5
+circuit_breaker_cooldown_ms = 30000
+# Backends that take over a call, in order of preference, when this backend's
+# breaker is open or a call fails as unavailable. Names of other [[backend]]
+# blocks. The fallback receives the model name the service asked for: a chat
+# backend with upstream_model handles any name. A chat backend is not
+# calibrated like Jev, so check its answers before you rely on it.
+# fallback = ["huggingface"]
+
 # A chat backend: a generative model behind an OpenAI-compatible chat
 # completions API. Each question becomes one chat request that asks for a
 # single token, and the answer is built from that token's logprobs.

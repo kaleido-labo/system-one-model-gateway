@@ -36,6 +36,12 @@ Steps 1 to 5 happen per call, in the caller's request. Steps 6 to 9 happen per
 backend: every backend has its own queue, request limit, token budget and
 connection limit, so a slow provider never holds up another.
 
+Two things can move a call to another backend. Step 4 skips a backend whose
+circuit breaker is open, and step 8 reports every upstream call to that breaker.
+When the backend that serves the model is unavailable, the call goes to its
+fallback and runs steps 6 to 9 there. See
+[Fallback](#fallback-and-the-circuit-breaker).
+
 ## 1. Receive
 
 The public server accepts the request, gives it an `x-request-id` (or keeps
@@ -83,6 +89,11 @@ The service's `allowed_models` is checked first (403), then the model picks a
 backend by the most specific match in `models` (422 when none matches). A chat
 backend also refuses here what it cannot express, such as a Choice with more
 than 26 options. See [Backends](backends.md#how-a-model-picks-a-backend).
+
+The routed backend's circuit breaker is consulted last, when the call is about
+to be queued. If the breaker is open, the call goes to the first fallback that
+accepts it, or is answered at once with a 503 when none does. See
+[Fallback and the circuit breaker](#fallback-and-the-circuit-breaker).
 
 ## 5. Admit
 
@@ -200,6 +211,37 @@ pause ends, batches leave one slot apart instead of together.
 Errors that are not retried, such as a 400 or a 403, go back to the caller as
 the backend sent them. A 401 from the backend is turned into a 502, because the
 caller's key was fine and the gateway's own key is not.
+
+### Fallback and the circuit breaker
+
+The final outcome of each upstream call, after its retries, is reported to the
+backend's circuit breaker. `circuit_breaker_failures` failures in a row (network
+errors, 5xx, 529, or a 401 for the gateway's key) open it, and an open breaker
+turns calls away for `circuit_breaker_cooldown_ms`. Then one trial call goes
+through: an answer closes the breaker, a failure opens it again. A 429 or a
+client error counts as an answer, since the backend is up. The count is per
+upstream call: a merged call that fails is one failure, however many callers it
+carried.
+
+For a call routed to a backend that has `fallback` set, the gateway builds a
+list of candidates: the backend, then its fallbacks in order, each followed by
+its own. It picks the first whose breaker lets the call through, and that can
+express the question. Then:
+
+- If that backend answers, or fails in a way another backend could not fix
+  (a 400, a 429), the caller gets the outcome.
+- If it fails as unavailable (network error, timeout, 5xx, refused key) and the
+  call has at least one second left before its deadline, the call is read again
+  from the request body and sent to the next candidate, with a fresh queue
+  deadline there but the same overall deadline. The caller waits once, for the
+  answer of whichever backend ends up serving it.
+- If no candidate is left, the caller gets the last failure, or, when every
+  breaker turned the call away, a 503 with `retry-after` set to the shortest
+  cool-down left.
+
+Fallback is decided per caller, after the batch returns, so one caller's
+retry does not hold up the others of a merged call. The fallback backend batches
+the call with its own callers like any other.
 
 ### When a merged call is rejected
 
