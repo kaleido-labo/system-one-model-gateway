@@ -10,7 +10,7 @@ use std::borrow::Borrow;
 use axum::http::HeaderMap;
 use reqwest::StatusCode;
 use serde_json::Value;
-use systemone_gateway::{Config, Gateway, hash_key};
+use systemone_gateway::{Config, Gateway, Reloaded, hash_key};
 
 // Each test binary uses a different part of what this module re-exports.
 #[allow(unused_imports)]
@@ -80,36 +80,45 @@ impl Reply {
     }
 }
 
+/// The configuration file for `setup`, with the backends on the mock at `url`.
+pub fn config_text(setup: &Setup, url: &str) -> String {
+    let admin_token_env = if setup.admin_token.is_some() {
+        "admin_token_env = \"MOCK_ADMIN_TOKEN\"\n"
+    } else {
+        ""
+    };
+    let mut toml = format!(
+        "[server]\nlisten = \"127.0.0.1:0\"\nadmin_listen = \"127.0.0.1:0\"\n{admin_token_env}{}\n\
+         [[backend]]\nname = \"typesafe\"\nbase_url = \"{url}\"\napi_key_env = \"MOCK_KEY\"\n\
+         models = [\"jev-*\"]\nbackoff_initial_ms = 20\nbackoff_max_ms = 100\n{}\n",
+        setup.server, setup.upstream
+    );
+    if let Some(chat) = setup.chat {
+        toml.push_str(&format!(
+            "[[backend]]\nname = \"hf\"\nprotocol = \"chat\"\nbase_url = \"{url}/v1\"\n\
+             api_key_env = \"MOCK_KEY\"\n{}backoff_initial_ms = 20\nbackoff_max_ms = 100\n{chat}\n",
+            // A test may list its own models.
+            if chat.contains("models =") {
+                ""
+            } else {
+                "models = [\"Qwen/*\"]\n"
+            },
+        ));
+    }
+    toml.push_str(&format!("[coalescing]\n{}\n", setup.coalescing));
+    for (name, key, extra) in &setup.services {
+        toml.push_str(&format!(
+            "[[service]]\nname = \"{name}\"\nkey_sha256 = [\"{}\"]\n{extra}\n",
+            hex::encode(hash_key(key))
+        ));
+    }
+    toml
+}
+
 impl Harness {
     pub async fn start(setup: Setup) -> Self {
         let mock = MockUpstream::start("127.0.0.1:0".parse().unwrap(), UPSTREAM_KEY).await;
-        let admin_token_env = if setup.admin_token.is_some() {
-            "admin_token_env = \"MOCK_ADMIN_TOKEN\"\n"
-        } else {
-            ""
-        };
-        let mut toml = format!(
-            "[server]\nlisten = \"127.0.0.1:0\"\nadmin_listen = \"127.0.0.1:0\"\n{admin_token_env}{}\n\
-             [[backend]]\nname = \"typesafe\"\nbase_url = \"{}\"\napi_key_env = \"MOCK_KEY\"\n\
-             models = [\"jev-*\"]\nbackoff_initial_ms = 20\nbackoff_max_ms = 100\n{}\n",
-            setup.server, mock.url, setup.upstream
-        );
-        if let Some(chat) = setup.chat {
-            toml.push_str(&format!(
-                "[[backend]]\nname = \"hf\"\nprotocol = \"chat\"\nbase_url = \"{}/v1\"\n\
-                 api_key_env = \"MOCK_KEY\"\n{}backoff_initial_ms = 20\nbackoff_max_ms = 100\n{chat}\n",
-                mock.url,
-                // A test may list its own models.
-                if chat.contains("models =") { "" } else { "models = [\"Qwen/*\"]\n" },
-            ));
-        }
-        toml.push_str(&format!("[coalescing]\n{}\n", setup.coalescing));
-        for (name, key, extra) in &setup.services {
-            toml.push_str(&format!(
-                "[[service]]\nname = \"{name}\"\nkey_sha256 = [\"{}\"]\n{extra}\n",
-                hex::encode(hash_key(key))
-            ));
-        }
+        let toml = config_text(&setup, &mock.url);
         let config = Config::from_toml(&toml).expect("the test configuration is valid");
         let key = setup.gateway_key;
         let admin_token = setup.admin_token;
@@ -125,6 +134,18 @@ impl Harness {
             gateway,
             client: reqwest::Client::new(),
         }
+    }
+
+    /// The file `setup` would be, for the same mock.
+    pub fn config_text(&self, setup: &Setup) -> String {
+        config_text(setup, &self.mock.url)
+    }
+
+    /// Reloads the running gateway with `setup`, as if the file had been
+    /// edited into it.
+    pub fn reload(&self, setup: &Setup) -> anyhow::Result<Reloaded> {
+        let config = Config::from_toml(&self.config_text(setup))?;
+        self.gateway.reload(&config)
     }
 
     pub fn url(&self, path: &str) -> String {

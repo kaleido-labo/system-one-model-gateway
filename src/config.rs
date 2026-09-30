@@ -440,6 +440,25 @@ mod tests {
     }
 
     #[test]
+    fn the_reload_interval_is_off_or_not_absurdly_short() {
+        let with = |ms: u64| {
+            Config::from_toml(&format!(
+                "[server]\nconfig_reload_interval_ms = {ms}\n{}",
+                with_service("")
+            ))
+        };
+        assert_eq!(with(0).unwrap().server.config_reload_interval_ms, 0);
+        assert!(with(100).is_ok());
+        let err = with(50).unwrap_err();
+        assert!(
+            err.to_string().contains("config_reload_interval_ms"),
+            "{err}"
+        );
+        let default = Config::from_toml(&with_service("")).unwrap();
+        assert_eq!(default.server.config_reload_interval_ms, 0);
+    }
+
+    #[test]
     fn tracing_is_off_by_default_and_its_table_is_strict() {
         let config = Config::from_toml(&with_service("")).unwrap();
         assert_eq!(config.tracing.otlp_endpoint, None);

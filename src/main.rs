@@ -1,7 +1,7 @@
 use std::io::{BufRead, IsTerminal};
 use std::path::PathBuf;
 
-use anyhow::ensure;
+use anyhow::{Context, ensure};
 use clap::{Parser, Subcommand};
 use systemone_gateway::{
     Config, Gateway, LogFormat, Protocol, Telemetry, generate_key, hash_key, logs_filter,
@@ -57,9 +57,31 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn serve(path: PathBuf) -> anyhow::Result<()> {
-    let config = Config::load(&path)?;
+    let (config, loaded) = Config::load_hashed(&path)?;
     let telemetry = init_logging(&config)?;
+    // Before the gateway starts: a SIGHUP that arrives while it binds its
+    // ports would otherwise end the process, which is what SIGHUP does when
+    // nobody is listening for it.
+    #[cfg(unix)]
+    let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .context("could not listen for SIGHUP")?;
     let gateway = Gateway::start(&config, |variable| std::env::var(variable).ok()).await?;
+    let reloader = gateway.reloader();
+    #[cfg(unix)]
+    tokio::spawn({
+        let (reloader, path) = (reloader.clone(), path.clone());
+        async move {
+            while hangup.recv().await.is_some() {
+                info!("SIGHUP received; reloading the configuration");
+                // Logged and counted by the reloader; the gateway keeps
+                // running on the old configuration when this fails.
+                let _ = reloader.reload_file(&path);
+            }
+        }
+    });
+    // Idle unless server.config_reload_interval_ms is set, now or by a
+    // later reload.
+    tokio::spawn(async move { reloader.watch_file(path, loaded).await });
     shutdown_signal().await;
     info!("shutting down; letting in-flight calls finish");
     let stopped = gateway.shutdown().await;
@@ -113,6 +135,12 @@ fn check_config(path: PathBuf) -> anyhow::Result<()> {
             config.tracing.service_name, endpoint.url, endpoint.source, config.tracing.sample_ratio,
         ),
         None => println!("tracing: off"),
+    }
+    match config.server.config_reload_interval_ms {
+        0 => println!("config reload: on SIGHUP"),
+        every => println!(
+            "config reload: on SIGHUP, and when the file changes (checked every {every} ms)"
+        ),
     }
     match config.coalescing.window_ms {
         0 => println!("merging: off"),
