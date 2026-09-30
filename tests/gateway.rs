@@ -169,7 +169,7 @@ async fn identical_questions_from_two_services_are_sent_once() {
     assert!(
         h.metrics()
             .await
-            .contains("systemone_gateway_deduplicated_questions_total 1")
+            .contains("systemone_gateway_deduplicated_questions_total{backend=\"typesafe\"} 1")
     );
 }
 
@@ -309,7 +309,7 @@ async fn a_rejected_merged_call_is_replayed_so_only_the_culprit_fails() {
     assert!(
         h.metrics()
             .await
-            .contains("systemone_gateway_isolated_replays_total 2")
+            .contains("systemone_gateway_isolated_replays_total{backend=\"typesafe\"} 2")
     );
 }
 
@@ -478,8 +478,11 @@ async fn metrics_account_per_service_and_per_upstream_call() {
         r#"systemone_gateway_questions_total{service="ocr"} 2"#,
         r#"systemone_gateway_questions_total{service="fraud"} 1"#,
         r#"systemone_gateway_upstream_calls_total{backend="typesafe",status="200"} 1"#,
-        "systemone_gateway_batch_callers_sum 2.0",
-        "systemone_gateway_batch_callers_count 1",
+        r#"systemone_gateway_batch_callers_sum{backend="typesafe"} 2.0"#,
+        r#"systemone_gateway_batch_callers_count{backend="typesafe"} 1"#,
+        r#"systemone_gateway_batch_questions_count{backend="typesafe"} 1"#,
+        r#"systemone_gateway_queue_wait_seconds_count{backend="typesafe"} 1"#,
+        r#"systemone_gateway_estimated_tokens_saved_total{backend="typesafe"}"#,
     ] {
         assert!(metrics.contains(line), "missing {line:?} in\n{metrics}");
     }
@@ -510,6 +513,60 @@ async fn health_readiness_and_unknown_routes() {
     let missing = h.get("key-ocr", "/v1/unknown").await;
     assert_eq!(missing.status, 404);
     assert_eq!(missing.body["error"]["type"], "not_found_error");
+}
+
+#[tokio::test]
+async fn an_admin_token_protects_metrics_only() {
+    let h = Harness::start(Setup {
+        admin_token: Some("scrape-secret"),
+        ..Setup::default()
+    })
+    .await;
+
+    // The probes stay open: a Kubernetes probe cannot easily send a header.
+    assert_eq!(
+        h.admin("/healthz").await,
+        (reqwest::StatusCode::OK, "ok".to_owned())
+    );
+    assert_eq!(
+        h.admin("/readyz").await,
+        (reqwest::StatusCode::OK, "ready".to_owned())
+    );
+
+    for authorization in [
+        None,
+        Some("Bearer wrong-token"),
+        Some("Bearer scrape-secret-and-more"),
+        Some("Basic scrape-secret"),
+        Some("scrape-secret"),
+    ] {
+        let (status, text) = h.admin_with("/metrics", authorization).await;
+        assert_eq!(status, 401, "{authorization:?}: {text}");
+        let body: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["error"]["type"], "authentication_error");
+        assert!(!text.contains("scrape-secret"), "{text}");
+    }
+
+    let (status, metrics) = h.admin_with("/metrics", Some("Bearer scrape-secret")).await;
+    assert_eq!(status, 200);
+    assert!(metrics.ends_with("# EOF\n"));
+    let (status, _) = h.admin_with("/metrics", Some("bearer scrape-secret")).await;
+    assert_eq!(status, 200, "the scheme name is case-insensitive");
+
+    // The token does not open or close anything on the public port.
+    let reply = h
+        .call("key-ocr", call_body(document(), json!({"q": noul("A?")})))
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.text);
+}
+
+#[tokio::test]
+async fn without_an_admin_token_the_admin_port_is_open() {
+    let h = Harness::start(Setup::default()).await;
+    for authorization in [None, Some("Bearer anything")] {
+        let (status, _) = h.admin_with("/metrics", authorization).await;
+        assert_eq!(status, 200, "{authorization:?}");
+    }
 }
 
 #[tokio::test]

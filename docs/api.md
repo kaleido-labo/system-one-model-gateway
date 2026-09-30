@@ -22,8 +22,8 @@ Authorization: Bearer s1gw_...
 
 The scheme name is case-insensitive. The gateway hashes the key and looks the
 hash up among the `key_sha256` values of the configuration, so a missing or
-unknown key gets a 401 and never reaches a backend. The admin port has no
-authentication.
+unknown key gets a 401 and never reaches a backend. The admin port has its own,
+optional token, see [Admin endpoints](#admin-endpoints).
 
 The TypeSafe Python SDK reads `TYPESAFE_BASE_URL` and `TYPESAFE_API_KEY`, so
 pointing a service at the gateway is a matter of setting both. For another SDK,
@@ -134,7 +134,13 @@ Listing a model does not mean a service may use it: a service's
 | --- | --- |
 | `GET /healthz` | `200 ok` while the process runs. |
 | `GET /readyz` | `200 ready` once both listeners are up; `503 shutting down` once shutdown has started. The admin server stops accepting connections at the same time, so a new probe may get a refused connection instead. |
-| `GET /metrics` | Prometheus metrics in OpenMetrics text, see [Operations](operations.md#metrics). |
+| `GET /metrics` | Prometheus metrics in OpenMetrics text, see [Operations](operations.md#metrics). Needs `Authorization: Bearer <token>` when `server.admin_token_env` is configured; a missing or wrong token gets a 401 in the [error shape](#errors) below. |
+
+The admin port is open unless `server.admin_token_env` names an environment
+variable that holds a token. The token protects `/metrics` only. `/healthz` and
+`/readyz` stay open in every case, because Kubernetes probes cannot easily send
+a header, and what they answer is nothing you need to hide. The token is
+compared in constant time, and the scheme name is case-insensitive.
 
 ## Errors
 
@@ -152,7 +158,7 @@ against TypeSafe, and retry the same statuses (429 and 5xx) while honouring
 | Status | `type` | When |
 | --- | --- | --- |
 | 400 | `invalid_request_error` | The body is not a JSON object. |
-| 401 | `authentication_error` | Missing, malformed or unknown service key. |
+| 401 | `authentication_error` | Missing, malformed or unknown service key. On the admin port: a missing or wrong token for `/metrics`. |
 | 403 | `permission_error` | The model is not in the service's `allowed_models`. `param` is `model`. |
 | 404 | `not_found_error` | No such route on the public port. |
 | 422 | `validation_error` | A documented rule is broken, no backend serves the model, or a chat backend cannot express the question (more than 26 options). `param` names the field. |
@@ -171,15 +177,19 @@ A 429 from the gateway has one of these causes, and the `message` says which:
 - the shared `tokens_per_second` budget is spent;
 - the backend asked everyone to back off and its pause outlasts the call.
 
-Two kinds of response do not use this shape:
+When a backend answers an error status that the gateway does not retry (400,
+403, 422...), or keeps answering 429, 500, 502, 503, 504 or 529 until the
+retries run out, the caller gets that status and the backend's `retry-after`
+headers. A backend's 401 is the exception: it means the gateway's key is wrong,
+so the caller gets a 502. The body depends on the protocol:
 
-- **Errors passed through from a backend.** When a backend answers an error
-  status that the gateway does not retry (400, 403, 422...), or keeps answering
-  429, 500, 502, 503, 504 or 529 until the retries run out, the caller gets
-  that status, that body and the backend's `retry-after` headers, as sent. A
-  chat backend's error body is in its own format, not TypeSafe's. A backend's
-  401 is the exception: it means the gateway's key is wrong, so the caller gets
-  a 502.
-- **Errors from the HTTP layer.** A body larger than `server.max_body_bytes`
-  gets a `413` with a plain-text body, and a wrong method on a known route
-  gets a `405` with an empty body. Both are sent before authentication.
+- **A System One backend**: the body as sent, because it already is TypeSafe's.
+- **A chat backend**: a body in the shape above. The `type` follows the status
+  as in the table (a provider's 500 or 503 is `upstream_error`), and the
+  `message` is the provider's own text when its body has one, see
+  [Backends](backends.md#limits-compared-to-a-system-one-backend).
+
+Errors from the HTTP layer do not use this shape. A body larger than
+`server.max_body_bytes` gets a `413` with a plain-text body, and a wrong method
+on a known route gets a `405` with an empty body. Both are sent before
+authentication.

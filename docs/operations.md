@@ -26,26 +26,33 @@ docker run -p 8080:8080 -p 9090:9090 \
   `/etc/systemone-gateway/gateway.toml` (set by `SYSTEMONE_GATEWAY_CONFIG`).
   Mount your file there.
 - Pass each backend's key as the environment variable named by its
-  `api_key_env`. The gateway refuses to start when one is missing.
+  `api_key_env`, and the admin token as the one named by
+  `server.admin_token_env` if you configure it. The gateway refuses to start
+  when one is missing.
 - The image exposes 8080 (API) and 9090 (health and metrics). To run another
   command, such as `check-config`, put it after the image name:
   `docker run --rm -v ... systemone-gateway check-config`.
-- The gateway serves plain HTTP and its admin port has no authentication.
-  Terminate TLS in front of the public port, and keep port 9090 off the public
-  network.
+- The gateway serves plain HTTP. Terminate TLS in front of the public port,
+  and keep port 9090 off the public network. Its `/metrics` is open unless you
+  configure `server.admin_token_env`, and `/healthz` and `/readyz` are always
+  open.
 
 ## Kubernetes
 
 - Put the configuration in a ConfigMap mounted at
   `/etc/systemone-gateway/gateway.toml`. It holds no secret.
 - Put each backend's key in a Secret and expose it as the environment variable
-  that `api_key_env` names.
+  that `api_key_env` names. Do the same for the admin token, if you configure
+  `server.admin_token_env`.
 - Point the liveness probe at `GET /healthz` and the readiness probe at
   `GET /readyz`, both on port 9090.
 - On SIGTERM the gateway stops accepting connections and lets in-flight calls
   finish. Set `terminationGracePeriodSeconds` a few seconds above
   `server.request_timeout_ms`.
-- Scrape `GET /metrics` on port 9090.
+- Scrape `GET /metrics` on port 9090. With `server.admin_token_env` configured,
+  `/metrics` needs `Authorization: Bearer <token>`: give the scraper the same
+  token, as in the Prometheus example below. The probes need no header, because
+  `/healthz` and `/readyz` stay open even then.
 
 ```yaml
 livenessProbe:
@@ -53,6 +60,22 @@ livenessProbe:
 readinessProbe:
   httpGet: { path: /readyz, port: 9090 }
 ```
+
+A Prometheus scrape job for a gateway with an admin token. The token sits in a
+file that Prometheus can read, mounted from the same Kubernetes Secret:
+
+```yaml
+scrape_configs:
+  - job_name: systemone-gateway
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/gateway-admin-token
+    static_configs:
+      - targets: ["systemone-gateway:9090"]
+```
+
+Leave `authorization` out when the gateway has no admin token.
 
 Pacing, quotas and merging live in memory, so they apply per process. With N
 replicas, give each replica 1/N of each backend's `requests_per_minute` and
@@ -113,17 +136,19 @@ Every name starts with `systemone_gateway_`.
 
 ### Merging
 
-| Metric | Type | Meaning |
-| --- | --- | --- |
-| `batch_callers` | histogram | Service calls answered by one batch. Mostly 1 means little merging. |
-| `batch_questions` | histogram | Distinct questions in one batch. |
-| `queue_wait_seconds` | histogram | Time from a batch's first call arriving to the batch going upstream. The cost of merging and pacing in latency. |
-| `deduplicated_questions_total` | counter | Questions left out because an identical one was already in the same upstream call. |
-| `estimated_tokens_saved_total` | counter | Estimated input tokens not billed thanks to merging. System One backends only, because a chat backend repeats the state for every question. It is an estimate. |
-| `isolated_replays_total` | counter | Calls replayed alone after the merged call they were in was rejected. |
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `batch_callers` | histogram | `backend` | Service calls answered by one batch. Mostly 1 means little merging. |
+| `batch_questions` | histogram | `backend` | Distinct questions in one batch. |
+| `queue_wait_seconds` | histogram | `backend` | Time from a batch's first call arriving to the batch going upstream. The cost of merging and pacing in latency. |
+| `deduplicated_questions_total` | counter | `backend` | Questions left out because an identical one was already in the same upstream call. |
+| `estimated_tokens_saved_total` | counter | `backend` | Estimated input tokens not billed thanks to merging. System One backends only, because a chat backend repeats the state for every question. It is an estimate. |
+| `isolated_replays_total` | counter | `backend` | Calls replayed alone after the merged call they were in was rejected. |
 
-The three merging histograms have no `backend` label: they aggregate all
-backends.
+These carry a `backend` label because backends do not merge alike: a chat
+backend repeats the state for every question, and each backend has its own
+limits, so one average over all of them hides which one merges and which one
+queues. Sum over `backend` for the gateway as a whole.
 
 ### Useful queries
 
@@ -136,11 +161,12 @@ sum by (service) (rate(systemone_gateway_calls_total{status="429"}[5m]))
 sum by (backend) (rate(systemone_gateway_upstream_calls_total{status="429"}[5m]))
 sum by (backend) (rate(systemone_gateway_upstream_retries_total[5m]))
 
-# How many calls share one upstream call
-rate(systemone_gateway_batch_callers_sum[5m]) / rate(systemone_gateway_batch_callers_count[5m])
+# How many calls share one upstream call, per backend
+sum by (backend) (rate(systemone_gateway_batch_callers_sum[5m]))
+  / sum by (backend) (rate(systemone_gateway_batch_callers_count[5m]))
 
-# 95th percentile of the time a batch waits before going upstream
-histogram_quantile(0.95, sum by (le) (rate(systemone_gateway_queue_wait_seconds_bucket[5m])))
+# 95th percentile of the time a batch waits before going upstream, per backend
+histogram_quantile(0.95, sum by (backend, le) (rate(systemone_gateway_queue_wait_seconds_bucket[5m])))
 
 # Input tokens per service
 sum by (service, backend) (rate(systemone_gateway_input_tokens_total[1h]))
@@ -159,7 +185,7 @@ backs off on every 429 but does not learn a lower rate by itself.
 
 **Concurrency.** `max_concurrency` bounds the batches in flight to a backend.
 The number you need is about the batches per second times the upstream latency
-in seconds. Raise it if `queue_wait_seconds` is high while the request limit
+in seconds. Raise it if a backend's `queue_wait_seconds` is high while the request limit
 is not reached. Keep it above that product, or batches queue for a connection
 instead of a request slot.
 
@@ -168,9 +194,10 @@ instead of a request slot.
 - Raising `window_ms` gives calls more time to meet, at the price of latency
   for every call. The window is a floor: under load, a batch waits for its
   request slot and keeps collecting calls anyway.
-- `batch_callers` averaging 1 means services rarely ask about the same state at
-  the same moment; the window is then pure latency, and `window_ms = 0` is
-  reasonable.
+- `batch_callers` averaging 1 means services rarely ask about the same state
+  at the same moment; the window is then pure latency, and `window_ms = 0` is
+  reasonable. Read it per backend: a backend that few services use can sit at 1
+  while another merges well, and `window_ms` applies to all of them.
 - Keep `max_request_tokens` and `max_state_plus_question_tokens` below the
   provider's limits. If TypeSafe rejects large merged calls as too big, lower
   those two, or lower `bytes_per_token` so that the gateway counts more tokens
@@ -227,5 +254,7 @@ SDK timeout (10 s by default, in the caller)
   them.
 - **No answer cache.** Two identical calls a minute apart cost two upstream
   requests. Only calls that are in the gateway at the same time share one.
-- **No TLS and no admin authentication.** Put the gateway behind a proxy or
-  mesh that terminates TLS, and keep the admin port private.
+- **No TLS, and only a light guard on the admin port.** Put the gateway behind
+  a proxy or mesh that terminates TLS, and keep the admin port private. The
+  optional `server.admin_token_env` protects `/metrics` and nothing else: the
+  probes stay open, and without TLS the token travels in clear text.

@@ -47,17 +47,25 @@ pub struct Metrics {
     pub upstream_calls: Family<UpstreamLabels, Counter>,
     pub upstream_duration: HistogramFamily<BackendLabels>,
     pub upstream_retries: Family<BackendLabels, Counter>,
-    pub batch_callers: Histogram,
-    pub batch_questions: Histogram,
-    pub deduplicated_questions: Counter,
-    pub estimated_tokens_saved: Counter,
-    pub isolated_replays: Counter,
-    pub queue_wait: Histogram,
+    pub batch_callers: HistogramFamily<BackendLabels>,
+    pub batch_questions: HistogramFamily<BackendLabels>,
+    pub deduplicated_questions: Family<BackendLabels, Counter>,
+    pub estimated_tokens_saved: Family<BackendLabels, Counter>,
+    pub isolated_replays: Family<BackendLabels, Counter>,
+    pub queue_wait: HistogramFamily<BackendLabels>,
 }
 
 fn latency_histogram() -> Histogram {
     // 5 ms to about 10 s.
     Histogram::new(exponential_buckets(0.005, 2.0, 12))
+}
+
+fn callers_histogram() -> Histogram {
+    Histogram::new([1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 32.0, 64.0])
+}
+
+fn questions_histogram() -> Histogram {
+    Histogram::new(exponential_buckets(1.0, 2.0, 9))
 }
 
 impl Metrics {
@@ -108,40 +116,43 @@ impl Metrics {
             "Upstream attempts retried after a 429, 529, 5xx or network error",
             upstream_retries.clone(),
         );
-        let batch_callers = Histogram::new([1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 32.0, 64.0]);
+        let batch_callers: HistogramFamily<BackendLabels> =
+            Family::new_with_constructor(callers_histogram);
         registry.register(
             "batch_callers",
-            "Service calls answered by one merged batch",
+            "Service calls answered by one merged batch, by backend",
             batch_callers.clone(),
         );
-        let batch_questions = Histogram::new(exponential_buckets(1.0, 2.0, 9));
+        let batch_questions: HistogramFamily<BackendLabels> =
+            Family::new_with_constructor(questions_histogram);
         registry.register(
             "batch_questions",
-            "Distinct questions sent in one merged batch",
+            "Distinct questions sent in one merged batch, by backend",
             batch_questions.clone(),
         );
-        let deduplicated_questions = Counter::default();
+        let deduplicated_questions = Family::<BackendLabels, Counter>::default();
         registry.register(
             "deduplicated_questions",
-            "Questions answered by an identical question already in the same upstream call",
+            "Questions answered by an identical question already in the same upstream call, by backend",
             deduplicated_questions.clone(),
         );
-        let estimated_tokens_saved = Counter::default();
+        let estimated_tokens_saved = Family::<BackendLabels, Counter>::default();
         registry.register(
             "estimated_tokens_saved",
-            "Estimated input tokens not billed because calls sharing a state were merged (System One backends only)",
+            "Estimated input tokens not billed because calls sharing a state were merged (System One backends only), by backend",
             estimated_tokens_saved.clone(),
         );
-        let isolated_replays = Counter::default();
+        let isolated_replays = Family::<BackendLabels, Counter>::default();
         registry.register(
             "isolated_replays",
-            "Calls replayed on their own after the merged call they were in was rejected",
+            "Calls replayed on their own after the merged call they were in was rejected, by backend",
             isolated_replays.clone(),
         );
-        let queue_wait = latency_histogram();
+        let queue_wait: HistogramFamily<BackendLabels> =
+            Family::new_with_constructor(latency_histogram);
         registry.register(
             "queue_wait_seconds",
-            "Time a batch waited between its first call arriving and going upstream",
+            "Time a batch waited between its first call arriving and going upstream, by backend",
             queue_wait.clone(),
         );
 
@@ -209,14 +220,25 @@ mod tests {
                 status: 200,
             })
             .inc();
-        metrics.batch_callers.observe(3.0);
+        metrics
+            .batch_callers
+            .get_or_create(&Metrics::backend("typesafe"))
+            .observe(3.0);
+        metrics
+            .isolated_replays
+            .get_or_create(&Metrics::backend("hf"))
+            .inc();
         let text = metrics.render();
         assert!(
             text.contains(r#"systemone_gateway_calls_total{service="ocr",status="200"} 1"#),
             "{text}"
         );
         assert!(
-            text.contains("systemone_gateway_batch_callers_count 1"),
+            text.contains(r#"systemone_gateway_batch_callers_count{backend="typesafe"} 1"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"systemone_gateway_isolated_replays_total{backend="hf"} 1"#),
             "{text}"
         );
         assert!(text.ends_with("# EOF\n"));

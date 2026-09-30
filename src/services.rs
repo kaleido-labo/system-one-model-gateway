@@ -118,7 +118,9 @@ impl ServiceRegistry {
     }
 }
 
-fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+/// The token of an `Authorization: Bearer <token>` header. The scheme name is
+/// case-insensitive.
+pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     let value = headers.get(AUTHORIZATION)?.to_str().ok()?;
     let (scheme, token) = value.trim().split_once(' ')?;
     let token = token.trim();

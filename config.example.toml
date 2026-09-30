@@ -32,6 +32,12 @@
 listen = "0.0.0.0:8080"
 # Operations: /healthz, /readyz, /metrics. Keep it off the public network.
 admin_listen = "0.0.0.0:9090"
+# Optional: the name of an environment variable that holds a bearer token for
+# /metrics. When configured, /metrics answers 401 unless the request carries
+# `Authorization: Bearer <token>`, and the gateway refuses to start if the
+# variable is empty. /healthz and /readyz stay open either way, because
+# Kubernetes probes cannot easily send a header.
+# admin_token_env = "GATEWAY_ADMIN_TOKEN"
 # Longest a call may take, queueing included; past it the caller gets a 504.
 # Keep it under the TypeSafe SDKs' default timeout (10 s), so callers see the
 # gateway's 504 instead of a client-side timeout that the SDK retries blindly.

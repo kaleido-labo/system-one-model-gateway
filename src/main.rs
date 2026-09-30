@@ -83,6 +83,10 @@ fn check_config(path: PathBuf) -> anyhow::Result<()> {
             backend.requests_per_minute,
         );
     }
+    match &config.server.admin_token_env {
+        Some(variable) => println!("admin port: /metrics needs the bearer token in ${variable}"),
+        None => println!("admin port: open"),
+    }
     match config.coalescing.window_ms {
         0 => println!("merging: off"),
         window => println!("merging: calls sharing a state within {window} ms go out together"),

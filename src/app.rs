@@ -12,7 +12,7 @@ use tracing::info;
 
 use crate::backend::Backends;
 use crate::config::{Config, millis};
-use crate::http::{AppState, Shared, admin_router, public_router};
+use crate::http::{AdminToken, AppState, Shared, admin_router, public_router};
 use crate::metrics::Metrics;
 use crate::services::ServiceRegistry;
 use crate::wire::TokenEstimator;
@@ -96,6 +96,20 @@ impl Gateway {
 }
 
 fn build_state(config: &Config, env: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<AppState> {
+    // Like a backend's key: a variable that is named but empty stops the
+    // start, so a typo cannot leave `/metrics` open without anyone noticing.
+    let admin_token = match &config.server.admin_token_env {
+        Some(variable) => {
+            let token = env(variable).unwrap_or_default();
+            let token = token.trim();
+            anyhow::ensure!(
+                !token.is_empty(),
+                "server.admin_token_env: the admin token must be in the {variable} environment variable"
+            );
+            Some(AdminToken::new(token))
+        }
+        None => None,
+    };
     let metrics = Arc::new(Metrics::new());
     Ok(AppState::new(Shared {
         registry: ServiceRegistry::from_config(&config.services),
@@ -103,6 +117,41 @@ fn build_state(config: &Config, env: &dyn Fn(&str) -> Option<String>) -> anyhow:
         metrics,
         estimator: TokenEstimator::new(config.coalescing.bytes_per_token),
         request_timeout: millis(config.server.request_timeout_ms),
+        admin_token,
         ready: AtomicBool::new(false),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(server: &str) -> Config {
+        Config::from_toml(&format!(
+            "[server]\n{server}\n[[service]]\nname = \"s\"\nkey_sha256 = [\"{}\"]\n",
+            "0".repeat(64)
+        ))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_missing_admin_token_stops_the_start() {
+        let config = config("admin_token_env = \"ADMIN_TOKEN\"");
+        // The typesafe backend's own key is provided; the admin token is not.
+        let backend_key = |variable: &str| (variable == "TYPESAFE_API_KEY").then(|| "k".to_owned());
+        let err = build_state(&config, &backend_key).err().unwrap();
+        assert!(err.to_string().contains("ADMIN_TOKEN"), "{err}");
+
+        // Blank counts as missing.
+        let blank =
+            |variable: &str| Some(if variable == "ADMIN_TOKEN" { "  " } else { "k" }.to_owned());
+        assert!(build_state(&config, &blank).is_err());
+
+        let both = |_: &str| Some("k".to_owned());
+        assert!(build_state(&config, &both).is_ok());
+
+        // No admin_token_env: nothing to look up.
+        let open = self::config("");
+        assert!(build_state(&open, &backend_key).is_ok());
+    }
 }

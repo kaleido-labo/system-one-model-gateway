@@ -172,6 +172,31 @@ async fn services_share_a_chat_batch_and_a_shared_question_is_asked_once() {
 }
 
 #[tokio::test]
+async fn merging_metrics_are_kept_per_backend() {
+    let h = Harness::start(chat_setup("")).await;
+    let jev = h
+        .call("key-ocr", call_body("jev-latest", json!({"q": noul("A?")})))
+        .await;
+    assert_eq!(jev.status, 200, "{}", jev.text);
+    let qwen = h
+        .call("key-ocr", call_body(QWEN, json!({"q": noul("A?")})))
+        .await;
+    assert_eq!(qwen.status, 200, "{}", qwen.text);
+    let metrics = h.metrics().await;
+    for backend in ["typesafe", "hf"] {
+        for name in ["batch_callers", "batch_questions", "queue_wait_seconds"] {
+            let line = format!(r#"systemone_gateway_{name}_count{{backend="{backend}"}} 1"#);
+            assert!(metrics.contains(&line), "missing {line:?} in\n{metrics}");
+        }
+    }
+    // A chat backend repeats the state for every question: no tokens saved.
+    assert!(
+        !metrics.contains(r#"estimated_tokens_saved_total{backend="hf"}"#),
+        "{metrics}"
+    );
+}
+
+#[tokio::test]
 async fn the_model_name_picks_the_backend() {
     let h = Harness::start(chat_setup("")).await;
     let jev = h
@@ -249,6 +274,86 @@ async fn a_429_on_a_chat_call_is_retried() {
     ] {
         assert!(metrics.contains(line), "missing {line:?} in\n{metrics}");
     }
+}
+
+#[tokio::test]
+async fn a_chat_api_error_comes_back_in_typesafe_shape() {
+    let h = Harness::start(chat_setup("")).await;
+    let questions = json!({"q": noul("A?")});
+
+    // OpenAI's format: the message is kept, the provider's own fields are not.
+    h.mock.state.push(
+        Scripted::status(
+            400,
+            r#"{"error": {"message": "Invalid value for top_logprobs", "type": "invalid_request_error", "param": "top_logprobs", "code": null}}"#,
+        )
+        .header("x-request-id", "chat_req_1"),
+    );
+    let reply = h.call("key-ocr", call_body(QWEN, questions.clone())).await;
+    assert_eq!(reply.status, 400, "{}", reply.text);
+    assert_eq!(
+        reply.body,
+        json!({"error": {
+            "type": "invalid_request_error",
+            "message": "Invalid value for top_logprobs",
+        }})
+    );
+    assert_eq!(reply.header("content-type"), "application/json");
+    assert_eq!(reply.header("x-systemone-gateway-backend"), "hf");
+    assert_eq!(reply.header("x-typesafe-request-id"), "chat_req_1");
+
+    // Hugging Face's format: a bare string.
+    h.mock
+        .state
+        .push(Scripted::status(403, r#"{"error": "Model access denied"}"#));
+    let reply = h.call("key-ocr", call_body(QWEN, questions.clone())).await;
+    assert_eq!(reply.status, 403, "{}", reply.text);
+    assert_eq!(reply.body["error"]["type"], "permission_error");
+    assert_eq!(reply.body["error"]["message"], "Model access denied");
+
+    // A body that is not JSON is replaced by a generic message, never echoed.
+    h.mock
+        .state
+        .push(Scripted::status(404, "Order 1042 not found on this server"));
+    let reply = h.call("key-ocr", call_body(QWEN, questions)).await;
+    assert_eq!(reply.status, 404, "{}", reply.text);
+    assert_eq!(reply.body["error"]["type"], "not_found_error");
+    let message = reply.body["error"]["message"].as_str().unwrap();
+    assert_eq!(message, "the chat backend answered with status 404");
+}
+
+#[tokio::test]
+async fn a_chat_api_error_on_one_question_fails_the_call_in_typesafe_shape() {
+    let h = Harness::start(chat_setup("")).await;
+    h.mock.state.push(Scripted::status(
+        422,
+        r#"{"error": {"message": "Unprocessable"}}"#,
+    ));
+    let reply = h
+        .call(
+            "key-ocr",
+            call_body(
+                QWEN,
+                json!({"a": noul("A? yes=0.9"), "b": noul("B? yes=0.9")}),
+            ),
+        )
+        .await;
+    assert_eq!(reply.status, 422, "{}", reply.text);
+    assert_eq!(reply.body["error"]["type"], "validation_error");
+    assert_eq!(reply.body["error"]["message"], "Unprocessable");
+    assert!(!reply.text.contains("Order 1042"), "{}", reply.text);
+}
+
+#[tokio::test]
+async fn a_system_one_error_is_passed_through_unchanged() {
+    let h = Harness::start(chat_setup("")).await;
+    let body = r#"{"error":{"type":"validation_error","message":"from TypeSafe","param":"model","extra":1}}"#;
+    h.mock.state.push(Scripted::status(422, body));
+    let reply = h
+        .call("key-ocr", call_body("jev-latest", json!({"q": noul("A?")})))
+        .await;
+    assert_eq!(reply.status, 422, "{}", reply.text);
+    assert_eq!(reply.text, body);
 }
 
 #[tokio::test]

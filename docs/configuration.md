@@ -20,8 +20,8 @@ The path comes from `--config`, then the `SYSTEMONE_GATEWAY_CONFIG`
 environment variable, then `gateway.toml` in the current directory.
 
 Unknown keys are rejected, so a typo stops the gateway at startup instead of
-being ignored. A backend's key variable that is unset or empty also stops
-`serve`, with a message naming the variable.
+being ignored. A backend's key variable, or the admin token's, that is unset or
+empty also stops `serve`, with a message naming the variable.
 
 Environment variables the gateway reads:
 
@@ -29,6 +29,7 @@ Environment variables the gateway reads:
 | --- | --- |
 | `SYSTEMONE_GATEWAY_CONFIG` | Path of the configuration file. |
 | The variable named by a backend's `api_key_env` | That backend's API key. |
+| The variable named by `server.admin_token_env` | The bearer token that `/metrics` requires. |
 | `TYPESAFE_API_KEY` | The TypeSafe key, but only when the file has no `[[backend]]` block (see below). |
 | `RUST_LOG` | Log level and filters, in the [`tracing-subscriber` syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html). Defaults to `info`. |
 
@@ -55,6 +56,7 @@ refuses it with a message: rename it to `[[backend]]` and add
 | --- | --- | --- | --- |
 | `listen` | socket address | `0.0.0.0:8080` | Public API: `POST /v1/systemone` and `GET /v1/models`. |
 | `admin_listen` | socket address | `0.0.0.0:9090` | `/healthz`, `/readyz` and `/metrics`. Keep this port off the public network. |
+| `admin_token_env` | string | unset | Name of the environment variable that holds a bearer token for `/metrics`. Unset leaves `/metrics` open. When set, `/metrics` answers 401 unless the request carries `Authorization: Bearer <token>`. `/healthz` and `/readyz` never ask for it, because Kubernetes probes cannot easily send a header. An empty name is refused. |
 | `request_timeout_ms` | integer, > 0 | `9000` | Longest a call may take from arrival to answer, queueing included. Past it the caller gets a 504. The TypeSafe SDKs time out after 10 s by default, so the default stays under that: callers get the gateway's 504 instead of a client-side timeout that the SDK would retry blindly. |
 | `max_body_bytes` | integer, > 0 | `2097152` | Largest request body. Larger requests get a 413. |
 | `log_format` | `"text"` or `"json"` | `"text"` | Log line format. Use `"json"` in production. |
@@ -170,6 +172,7 @@ it is later refused upstream.
 - a model pattern is empty or has a `*` anywhere but the end;
 - two backends list the same model entry;
 - a rate, a timeout or a size that must be positive is zero;
+- `server.admin_token_env` is an empty name;
 - a backend's `max_queue_wait_ms` is not smaller than `server.request_timeout_ms`;
 - a service has no `key_sha256`, a hash that is not 64 hexadecimal characters,
   or a hash shared with another service;
