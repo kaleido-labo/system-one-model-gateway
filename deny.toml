@@ -1,0 +1,27 @@
+# Configuration for cargo-deny (https://embarkstudios.github.io/cargo-deny/).
+# Run it with `cargo deny check`.
+
+[advisories]
+version = 2
+
+[licenses]
+version = 2
+# Permissive licenses only, all compatible with this project's MIT license.
+# Dependencies offered under an `OR` expression need only one of its licenses
+# to be listed here.
+allow = [
+  "Apache-2.0",
+  "BSD-3-Clause",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "Unicode-3.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
