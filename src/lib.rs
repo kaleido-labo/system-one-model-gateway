@@ -21,6 +21,8 @@
 //! - `wire`: the System One request and response format, and its validation.
 //! - `backend`: the providers behind the gateway, how a call is routed to one,
 //!   and how each one is spoken to (`upstream` client, `chat` protocol).
+//! - `cache`: the opt-in answer cache, which lets an identical call skip the
+//!   backend.
 //! - `scheduling`: merging calls that share a state, pacing upstream traffic
 //!   and splitting each answer and its token usage back between callers.
 //! - `error`: the errors the gateway answers itself, in TypeSafe's shape.
@@ -28,6 +30,7 @@
 
 mod app;
 mod backend;
+mod cache;
 mod config;
 mod error;
 mod http;

@@ -44,6 +44,8 @@ pub struct Backend {
     upstream: Arc<Upstream>,
     models: ModelList,
     max_queue_wait: Duration,
+    /// Whether the answer cache may serve and keep this backend's answers.
+    pub cached: bool,
 }
 
 /// What `GET /v1/models` shows for a backend.
@@ -162,6 +164,7 @@ impl Backend {
             upstream,
             models,
             max_queue_wait: millis(config.max_queue_wait_ms),
+            cached: config.cache,
         })
     }
 

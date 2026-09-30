@@ -13,6 +13,9 @@ the [configuration reference](configuration.md).
                                                                          v
                                    [5 admit: per-service rate and concurrency]
                                                                          │
+                                                                         v
+                 [5b answer cache, if on: a call fully cached is answered here]
+                                                                         │
         one queue per backend                                            v
    ┌─────────────────────────────────────────────────────────────────────────┐
    │ [6 batch: calls with the same model, state and extra fields join one    │
@@ -32,7 +35,7 @@ the [configuration reference](configuration.md).
              and its share of the token usage]
 ```
 
-Steps 1 to 5 happen per call, in the caller's request. Steps 6 to 9 happen per
+Steps 1 to 5b happen per call, in the caller's request. Steps 6 to 9 happen per
 backend: every backend has its own queue, request limit, token budget and
 connection limit, so a slow provider never holds up another.
 
@@ -89,6 +92,44 @@ than 26 options. See [Backends](backends.md#how-a-model-picks-a-backend).
 If the service has limits of its own, they apply now: `requests_per_minute` and
 `max_concurrent`. A service over either gets a 429 before it can take capacity
 from the others. The in-flight slot is held until the answer is sent.
+
+### Answer cache
+
+When `[cache]` is enabled and the routed backend has not opted out, the gateway
+looks each question of the call up in the answer cache before the call can join
+a batch. The key is the batch key (model, state, extra fields) plus the question
+key, so an answer is served only for exactly the same call.
+
+- **Every question is cached and fresh.** The call is answered on the spot. It
+  never reaches the batcher and books nothing: no request slot, no connection,
+  no tokens. The response is rebuilt from the cached answers under the caller's
+  own question ids, and its `usage` is zero, because the backend billed nothing.
+- **Some are cached.** Only the missing questions go upstream, through steps 6
+  to 9 as usual, and the cached answers are merged into the response under the
+  caller's ids. `usage` is what the smaller upstream call cost.
+- **None is cached**, or the caller sent `cache-control: no-cache`. The call
+  goes upstream as if the cache were off. `no-cache` skips the read only: the
+  answers that come back are still kept.
+
+A hit comes after authentication, validation, routing, `allowed_models` and the
+service's own limits, so the cache never answers a call the service could not
+have made. The call still spends one request of the service's
+`requests_per_minute` and holds its `max_concurrent` slot while it lasts: the
+service's limits count calls, and only the backend's limits count upstream
+requests.
+
+Once an upstream answer comes back in the caller's request, its answers are
+stored, each under its own question key. Only a successful answer is stored:
+an error from the backend, a 429 from the gateway or a body that cannot be read
+leaves the cache as it was. The cache is filled by the request handler, so a
+call that already gave up on a 504 does not fill it.
+
+The store is a bounded map in write order. Every entry lives for the same
+`ttl_ms`, so the oldest entry is also the one that expires first: the cache
+drops the expired entries from the front and, when it is full, the oldest one.
+Answers are kept as the raw JSON the backend sent, together with its response
+fields other than `answers` and `usage` (such as `model`), which is what lets a
+response be rebuilt without a call. Nothing the cache holds is ever logged.
 
 ## 6. Batch
 
@@ -238,7 +279,8 @@ gets a 502.
 ### Response headers
 
 The response adds `x-systemone-gateway-backend`, `x-systemone-gateway-batch-callers`
-and `x-typesafe-request-id`. See [API](api.md#response-headers).
+and `x-typesafe-request-id`, and `x-systemone-gateway-cache` when the answer
+cache is on. See [API](api.md#response-headers).
 
 ## Token estimates
 

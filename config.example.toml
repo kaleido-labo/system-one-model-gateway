@@ -105,6 +105,10 @@ max_queue_wait_ms = 2000
 # How long this backend's own GET /v1/models answer is kept in memory.
 # protocol = "systemone" only.
 models_cache_ttl_ms = 300000
+# Lets the [cache] below keep and serve this backend's answers. It does nothing
+# while [cache] is off. Set it to false for a backend whose answers should
+# differ from one call to the next.
+cache = true
 
 # A chat backend: a generative model behind an OpenAI-compatible chat
 # completions API. Each question becomes one chat request that asks for a
@@ -167,6 +171,23 @@ max_state_plus_question_tokens = 28000
 # Bytes of minified JSON counted as one token. TypeSafe does not publish Jev's
 # tokenizer, so this is a conservative guess.
 bytes_per_token = 3.0
+
+# ---------------------------------------------------------------------------
+# [cache]: optional answer cache
+# ---------------------------------------------------------------------------
+#
+# Off by default. With it on, a question answered a moment ago is not asked
+# again: an answer is kept per question, under the model, the state, the extra
+# top-level fields and the question, and served only for exactly the same call.
+# Callers can ask for a fresh answer with "cache-control: no-cache". The cache
+# lives in memory, per gateway process.
+
+[cache]
+enabled = false
+# How long an answer may be served after the backend gave it, in milliseconds.
+ttl_ms = 300000
+# Most answers held at once, one per question. When full, the oldest goes first.
+max_entries = 10000
 
 # ---------------------------------------------------------------------------
 # [[service]]: one block per calling service

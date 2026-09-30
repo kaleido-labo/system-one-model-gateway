@@ -72,6 +72,14 @@ stricter would turn away requests that TypeSafe accepts. A merged call that
 TypeSafe still rejects is replayed one caller at a time, see
 [Architecture](architecture.md#when-a-merged-call-is-rejected).
 
+### Request headers
+
+Besides the `Authorization` header, the gateway reads one more:
+
+| Header | Effect |
+| --- | --- |
+| `cache-control: no-cache` | Asks for fresh answers: the [answer cache](#answer-cache) is not read for this call. The answers that come back are still kept for the next caller. Other directives are ignored. Without the cache on, this header does nothing. |
+
 ### Response
 
 A `200` carries the backend's body, cut down to the caller's own questions, under
@@ -103,10 +111,36 @@ From a chat backend, answers are built by the gateway in TypeSafe's shape:
 | Header | Value |
 | --- | --- |
 | `x-systemone-gateway-backend` | Name of the backend that handled the call. Set on every outcome of a batch, success or error. Not set on errors decided before the call joined a batch (400, 401, 403, 422, a 429 for the service's own limits or a booked-out backend), nor on the 504 for `request_timeout_ms`. |
-| `x-systemone-gateway-batch-callers` | How many service calls shared the upstream call that answered this one. `1` means the call went alone. Only on a `200`. |
-| `x-typesafe-request-id` | The backend's request id, for support requests. It is the same for every caller of a merged call. For a chat backend, it is the first request id that its chat calls reported, read from the upstream `x-typesafe-request-id` or `x-request-id` header. |
+| `x-systemone-gateway-batch-callers` | How many service calls shared the upstream call that answered this one. `1` means the call went alone. Only on a `200`, and not when the [answer cache](#answer-cache) answered the whole call, because no upstream call was made. |
+| `x-systemone-gateway-cache` | Only when the answer cache is on for the backend that serves the model, and only on a `200`. `hit`: every answer came from the cache and nothing went upstream. `partial`: some did, and the others were asked upstream. `miss`: nothing came from the cache, including a call sent with `cache-control: no-cache`. |
+| `x-typesafe-request-id` | The backend's request id, for support requests. Not set on a `hit`, which made no backend call. It is the same for every caller of a merged call. For a chat backend, it is the first request id that its chat calls reported, read from the upstream `x-typesafe-request-id` or `x-request-id` header. |
 | `x-request-id` | The id of this call in the gateway's logs. The gateway uses the one in the request when there is one, and makes one otherwise. |
 | `retry-after`, `retry-after-ms` | On every 429 the gateway makes: how long to wait, in whole seconds (rounded up) and in milliseconds. The TypeSafe SDKs read `retry-after-ms` first. |
+
+### Answer cache
+
+When the operator turns on [`[cache]`](configuration.md#cache), a question that
+was answered a moment ago is not asked again. The cache is keyed by the model,
+the state, the extra top-level fields and the question, so a cached answer is
+only reused for exactly the same call, whichever service asked it and under
+whichever question id.
+
+- A `hit` answers without a backend call. The body has the same shape as any
+  other: the backend's `model` and other fields as they were cached, the answers
+  under your ids, and a `usage` of zero, because the backend billed nothing for
+  them. When the answers were cached by different calls, the `model` and the
+  other fields are those of the first question's. `x-systemone-gateway-backend`
+  names the backend the call was routed to.
+- A `partial` sends only the questions that were not cached. `usage` is what
+  that smaller call cost, and the cached answers add nothing to it.
+- Only successful answers are cached, never errors.
+- A hit is still authenticated, validated, routed and checked against
+  `allowed_models`, and it counts against the service's own
+  `requests_per_minute` and `max_concurrent`. It uses none of the backend's
+  capacity.
+- Send `cache-control: no-cache` when a call must reach the backend, for
+  example when the model behind an alias such as `jev-latest` may have changed
+  within the time to live.
 
 ## `GET /v1/models`
 

@@ -75,6 +75,11 @@ pub struct BackendConfig {
     /// `systemone` only: how long the backend's `GET /v1/models` is served
     /// from memory.
     pub models_cache_ttl_ms: u64,
+    /// Whether this backend's answers may be kept in the answer cache, when
+    /// `[cache]` is enabled. Turn it off for a backend whose answers should
+    /// differ from one call to the next, such as a chat model sampled at a
+    /// temperature above zero.
+    pub cache: bool,
 }
 
 pub const TYPESAFE_URL: &str = "https://api.typesafe.ai";
@@ -101,6 +106,7 @@ impl Default for BackendConfig {
             backoff_max_ms: 3_000,
             max_queue_wait_ms: 2_000,
             models_cache_ttl_ms: 300_000,
+            cache: true,
         }
     }
 }

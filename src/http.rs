@@ -25,6 +25,7 @@ use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::Level;
 
 use crate::backend::{Backends, REQUEST_ID};
+use crate::cache::AnswerCache;
 use crate::error::{GatewayError, insert_retry_after};
 use crate::metrics::Metrics;
 use crate::scheduling::Outcome;
@@ -39,6 +40,8 @@ pub use admin::AdminToken;
 
 /// How many calls shared the upstream call that answered this one.
 pub const BATCH_CALLERS: HeaderName = HeaderName::from_static("x-systemone-gateway-batch-callers");
+/// Whether the answer cache served the call: `hit`, `partial` or `miss`.
+pub const CACHE: HeaderName = HeaderName::from_static("x-systemone-gateway-cache");
 /// The backend that answered.
 pub const BACKEND: HeaderName = HeaderName::from_static("x-systemone-gateway-backend");
 
@@ -50,6 +53,8 @@ pub struct Shared {
     pub backends: Backends,
     pub metrics: Arc<Metrics>,
     pub estimator: TokenEstimator,
+    /// `None` unless `[cache]` is enabled.
+    pub cache: Option<AnswerCache>,
     pub request_timeout: Duration,
     /// Set when `server.admin_token_env` is: `/metrics` then needs it.
     pub admin_token: Option<AdminToken>,

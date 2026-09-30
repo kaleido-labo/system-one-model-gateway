@@ -4,6 +4,7 @@ use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
+use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
 
@@ -53,6 +54,9 @@ pub struct Metrics {
     pub estimated_tokens_saved: Family<BackendLabels, Counter>,
     pub isolated_replays: Family<BackendLabels, Counter>,
     pub queue_wait: HistogramFamily<BackendLabels>,
+    pub cache_hits: Family<BackendLabels, Counter>,
+    pub cache_misses: Family<BackendLabels, Counter>,
+    pub cache_entries: Gauge,
 }
 
 fn latency_histogram() -> Histogram {
@@ -155,6 +159,24 @@ impl Metrics {
             "Time a batch waited between its first call arriving and going upstream, by backend",
             queue_wait.clone(),
         );
+        let cache_hits = Family::<BackendLabels, Counter>::default();
+        registry.register(
+            "cache_hits",
+            "Questions answered from the answer cache, by backend",
+            cache_hits.clone(),
+        );
+        let cache_misses = Family::<BackendLabels, Counter>::default();
+        registry.register(
+            "cache_misses",
+            "Questions looked up in the answer cache and not found, by backend",
+            cache_misses.clone(),
+        );
+        let cache_entries = Gauge::default();
+        registry.register(
+            "cache_entries",
+            "Answers held by the answer cache, expired ones included until they are dropped",
+            cache_entries.clone(),
+        );
 
         Self {
             registry,
@@ -171,6 +193,9 @@ impl Metrics {
             estimated_tokens_saved,
             isolated_replays,
             queue_wait,
+            cache_hits,
+            cache_misses,
+            cache_entries,
         }
     }
 

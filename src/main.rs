@@ -91,6 +91,14 @@ fn check_config(path: PathBuf) -> anyhow::Result<()> {
         0 => println!("merging: off"),
         window => println!("merging: calls sharing a state within {window} ms go out together"),
     }
+    if config.cache.enabled {
+        println!(
+            "answer cache: on, {} answers for {} ms",
+            config.cache.max_entries, config.cache.ttl_ms
+        );
+    } else {
+        println!("answer cache: off");
+    }
     for service in &config.services {
         let rate = service
             .requests_per_minute
