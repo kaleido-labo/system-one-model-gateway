@@ -1,0 +1,60 @@
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Added
+
+- Repository files for contributors: CI workflow, Dependabot configuration,
+  issue forms, pull request template, contributing guide, security policy,
+  code of conduct, editor and rustfmt configuration, and a cargo-deny
+  configuration for license and advisory checks.
+- Repository metadata in `Cargo.toml`.
+
+## [0.1.0]
+
+First version of the gateway.
+
+### Added
+
+- `POST /v1/systemone`, accepting the same request and response as TypeSafe's
+  System One API, and `GET /v1/models`.
+- Merging of calls that share a model, a state and the same other top-level
+  fields into one upstream request. Identical questions are sent once, and the
+  upstream `usage` is split between callers so the shares add up to what the
+  backend billed.
+- Validation of requests against the documented System One rules before they
+  can join a merged call, so a malformed question fails on its own.
+- Pacing of upstream calls against a requests-per-minute and a
+  tokens-per-second budget, a cap on concurrent calls, and retries with
+  exponential backoff on 429, 529, 5xx and network errors that honor
+  `retry-after-ms` and `retry-after`.
+- A pause on every batch after a 429, with batches leaving one slot apart when
+  it ends, and a bounded queue wait: a call that cannot be served in time gets
+  a 429 with `retry-after`.
+- Replay of each caller alone when a backend rejects a merged request, so the
+  error reaches only the caller whose question caused it.
+- Service keys stored as SHA-256 hashes, with per-service quotas (requests per
+  minute, concurrent calls, allowed models) and several hashes per service for
+  key rotation.
+- Backends selected by model name, with exact and `prefix*` matching. The
+  `systemone` protocol covers TypeSafe or any server with the same API. The
+  `chat` protocol covers chat completion APIs such as Hugging Face Inference
+  Providers, vLLM or TGI, and reads answers from logprobs.
+- Prometheus metrics and the `/healthz` and `/readyz` probes on a separate
+  admin port, and logs in text or JSON that do not contain states or
+  questions.
+- Graceful shutdown that lets in-flight calls finish.
+- `serve`, `check-config`, `gen-key` and `hash-key` commands.
+- TOML configuration, documented in `config.example.toml`.
+- A distroless, non-root Docker image.
+- A mock upstream in `examples/`, also used by the end-to-end tests, to run
+  the gateway without a TypeSafe key.
+- MIT license.
+
+[Unreleased]: https://github.com/kaleido-labo/system-one-model-gateway/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/kaleido-labo/system-one-model-gateway/releases/tag/v0.1.0
