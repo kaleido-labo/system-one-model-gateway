@@ -132,7 +132,7 @@ Listing a model does not mean a service may use it: a service's
 | Endpoint | Answer |
 | --- | --- |
 | `GET /healthz` | `200 ok` while the process runs. |
-| `GET /readyz` | `200 ready` once both listeners are up; `503 shutting down` from the moment the gateway receives SIGTERM or SIGINT. |
+| `GET /readyz` | `200 ready` once both listeners are up; `503 shutting down` once shutdown has started. The admin server stops accepting connections at the same time, so a new probe may get a refused connection instead. |
 | `GET /metrics` | Prometheus metrics in OpenMetrics text, see [Operations](operations.md#metrics). |
 
 ## Errors
