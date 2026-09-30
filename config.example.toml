@@ -71,7 +71,9 @@ api_key_env = "TYPESAFE_API_KEY"
 models = ["jev-*"]
 
 # Limits of this backend, shared by every service. They are per gateway
-# process: with N replicas, give each one 1/N of them.
+# process: with N replicas, give each one 1/N of them, unless the replicas
+# share their pacing through Redis (see [cluster] at the end of this file), in
+# which case give every replica the account's full limits.
 requests_per_minute = 1200
 # Requests that may leave back to back. Defaults to one second's worth
 # (requests_per_minute / 60, at least 1).
@@ -199,3 +201,29 @@ key_sha256 = [
 ]
 requests_per_minute = 300
 allowed_models = ["jev-latest", "jev-1.13.0"]
+
+# ---------------------------------------------------------------------------
+# [cluster]: share the pacing between replicas through Redis (optional)
+# ---------------------------------------------------------------------------
+#
+# Leave this table out to keep every limit in memory, per process: Redis is
+# then never contacted. With it, the backends' requests_per_minute and
+# tokens_per_second, and each service's requests_per_minute, become limits of
+# the whole cluster: give every replica the same, full values. Merging,
+# max_concurrency and max_concurrent stay per process.
+#
+# [cluster]
+# Environment variable that holds the Redis URL, such as
+# redis://:password@redis.internal:6379/0. It is a variable because the URL can
+# carry a password. The gateway refuses to start when it is empty. Redis 5 or
+# later, or Valkey; no TLS (rediss://) yet. Required.
+# redis_url_env = "REDIS_URL"
+# Put in front of every key, so that several gateways or environments can share
+# one Redis. Letters, digits, '-', '_', '.' and ':'.
+# key_prefix = "systemone-gateway"
+# Longest to wait for Redis on one booking. Past it, that booking is paced on
+# this replica's own share (see expected_replicas) and the gateway carries on.
+# redis_timeout_ms = 200
+# Replicas that share the limits. Used only while Redis is down: each replica
+# then paces with its backends' and services' limits divided by this number.
+# expected_replicas = 1

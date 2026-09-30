@@ -89,6 +89,9 @@ than 26 options. See [Backends](backends.md#how-a-model-picks-a-backend).
 If the service has limits of its own, they apply now: `requests_per_minute` and
 `max_concurrent`. A service over either gets a 429 before it can take capacity
 from the others. The in-flight slot is held until the answer is sent.
+`max_concurrent` counts the calls in flight in this process, while
+`requests_per_minute` is shared between replicas when `[cluster]` is
+configured (see [Pace](#7-pace)).
 
 ## 6. Batch
 
@@ -167,6 +170,30 @@ Before a batch leaves, it:
 Callers that timed out or hung up before this point are dropped from the batch,
 so they are not paid for. If nobody is left, the batch gives its request slot
 back.
+
+### Pacing across replicas
+
+By default the three limits live in memory, so each replica paces on its own.
+With a `[cluster]` table, the same GCRA state, and the pause after a 429, lives
+in Redis and every replica books against one budget. The booking is one atomic
+Lua script per limit: it reads the stored theoretical arrival time, decides
+exactly as the in-memory version does, and writes it back, so two replicas
+booking at the same moment cannot both take the last slot. The script reads
+Redis's clock, not the replica's, because replicas' clocks drift. What it
+returns is a wait, and the replica turns it into a start time by adding it to
+its own clock once the answer arrives. Booking still never sleeps, but it is
+now a round trip.
+
+Redis is an optimisation of pacing, not a dependency of serving. If it cannot
+be reached within `redis_timeout_ms`, that booking is made on an in-memory
+limiter holding this replica's share of the limit (the limit divided by
+`expected_replicas`), and the call goes on. A warning is logged once per
+outage and `shared_limiter_errors_total` counts each failed booking.
+
+Only pacing is shared. Connections (`max_concurrency`), a service's
+`max_concurrent` and the open batches stay per process, so merging happens only
+between calls that reach the same replica. See
+[Operations](operations.md#sharing-the-limits-between-replicas).
 
 ## 8. Send
 

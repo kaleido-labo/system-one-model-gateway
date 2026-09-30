@@ -4,8 +4,8 @@ The gateway reads one TOML file. [`config.example.toml`](../config.example.toml)
 is a complete, commented starting point; this page lists every key.
 
 The file holds no secret. Services are identified by the SHA-256 of their key,
-and each backend's key comes from an environment variable that the file names.
-It can live in git or in a Kubernetes ConfigMap.
+and each backend's key and the Redis URL come from environment variables that
+the file names. It can live in git or in a Kubernetes ConfigMap.
 
 ## Loading and checking
 
@@ -21,7 +21,8 @@ environment variable, then `gateway.toml` in the current directory.
 
 Unknown keys are rejected, so a typo stops the gateway at startup instead of
 being ignored. A backend's key variable that is unset or empty also stops
-`serve`, with a message naming the variable.
+`serve`, with a message naming the variable, and so does the Redis URL
+variable when `[cluster]` is configured.
 
 Environment variables the gateway reads:
 
@@ -29,6 +30,7 @@ Environment variables the gateway reads:
 | --- | --- |
 | `SYSTEMONE_GATEWAY_CONFIG` | Path of the configuration file. |
 | The variable named by a backend's `api_key_env` | That backend's API key. |
+| The variable named by `cluster.redis_url_env` | The Redis URL, only when `[cluster]` is configured. |
 | `TYPESAFE_API_KEY` | The TypeSafe key, but only when the file has no `[[backend]]` block (see below). |
 | `RUST_LOG` | Log level and filters, in the [`tracing-subscriber` syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html). Defaults to `info`. |
 
@@ -39,6 +41,7 @@ Environment variables the gateway reads:
 [[backend]]       # one block per model provider; repeat as needed
 [coalescing]      # merging of calls that share a state
 [[service]]       # one block per calling service; at least one is required
+[cluster]         # optional: replicas share their pacing through Redis
 ```
 
 Every table except `[[service]]` may be left out. With no `[[backend]]` block,
@@ -100,6 +103,8 @@ or a sub-table (`[backend.request_extras]`) placed right after its backend.
 
 These limits describe the backend and are shared by every service. They are
 enforced per gateway process, so with N replicas give each one 1/N of them.
+With [`[cluster]`](#cluster) the replicas draw on one budget instead: give
+every replica the full limits. `max_concurrency` stays per process either way.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -158,6 +163,45 @@ The service's limits are checked once the request has been validated and
 routed. A call that passes spends one request of the service's budget, even if
 it is later refused upstream.
 
+With [`[cluster]`](#cluster), `requests_per_minute` is a limit of the whole
+cluster: a call that one replica admitted counts against the service on every
+replica. `max_concurrent` counts the calls in flight in this process, so each
+replica allows that many.
+
+## `[cluster]`
+
+Optional. Without it, every limit lives in memory, per process, and Redis is
+never contacted. With it, the replicas of a gateway keep these limits in Redis
+and draw on one budget:
+
+- each backend's `requests_per_minute` and `tokens_per_second`;
+- each service's `requests_per_minute`;
+- the pause that follows a 429 from a backend, so every replica pauses, not
+  only the one that got the 429.
+
+Set these to the limits of the whole cluster, the same on every replica. What
+stays per process, because it describes this process: `max_concurrency`,
+`max_concurrent`, and merging. See [Operations](operations.md#sharing-the-limits-between-replicas)
+for how it behaves, and what happens when Redis is down.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `redis_url_env` | string | required | Name of the environment variable that holds the Redis URL, such as `redis://:password@redis.internal:6379/0`. A variable, because the URL can carry a password. The gateway refuses to start when it is unset or empty, or does not hold a `redis://` URL. `rediss://` (TLS) is not supported. |
+| `key_prefix` | string | `"systemone-gateway"` | Put in front of every key the gateway writes, so that several gateways or environments can share one Redis. Letters, digits, `-`, `_`, `.` and `:`. |
+| `redis_timeout_ms` | integer, > 0 | `200` | Longest the gateway waits for Redis on one booking. Past it, that booking is paced on this replica's own share (see `expected_replicas`) and the call goes on. |
+| `expected_replicas` | integer, > 0 | `1` | How many replicas share the limits. Used only while Redis cannot be reached: each replica then paces with the limits above divided by this number. Set it to the number of replicas you run. |
+
+The gateway needs Redis 5 or later, or Valkey, as a single endpoint: Redis
+Cluster and Sentinel are not supported. It does not connect at startup,
+so a Redis that comes up after the gateway does not stop it from starting.
+
+```toml
+[cluster]
+redis_url_env = "REDIS_URL"
+key_prefix = "systemone-gateway"
+expected_replicas = 3
+```
+
 ## Validation summary
 
 `check-config` and `serve` both refuse a file where:
@@ -173,4 +217,9 @@ it is later refused upstream.
 - a backend's `max_queue_wait_ms` is not smaller than `server.request_timeout_ms`;
 - a service has no `key_sha256`, a hash that is not 64 hexadecimal characters,
   or a hash shared with another service;
-- no `[[service]]` block exists, because nobody could call the gateway.
+- no `[[service]]` block exists, because nobody could call the gateway;
+- `[cluster]` has an empty `redis_url_env`, a `key_prefix` that is empty or
+  uses another character, or a zero `redis_timeout_ms` or `expected_replicas`.
+
+`serve` also refuses to start when the variable named by `cluster.redis_url_env`
+is empty, or holds something other than a `redis://` URL.
