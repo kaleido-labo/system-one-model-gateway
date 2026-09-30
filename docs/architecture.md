@@ -44,11 +44,18 @@ the one it came with) and opens a log span. Bodies larger than
 gateway never logs a body, because states and questions can carry personal or
 financial data.
 
+When [tracing](operations.md#traces) is on, the call also gets a trace span
+here, which ends with the answer.
+
 ## 2. Authenticate
 
 The service is identified by its bearer key. The gateway hashes the key with
 SHA-256 and looks the hash up among the `key_sha256` values of the `[[service]]`
 blocks, so it never holds a usable key. A missing or unknown key gets a 401.
+
+With tracing on, the call's span becomes a child of the caller's span here, from
+the `traceparent` header. It happens after authentication so that only a known
+service can decide what the gateway records.
 
 ## 3. Validate
 

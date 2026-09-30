@@ -30,6 +30,9 @@ Environment variables the gateway reads:
 | `SYSTEMONE_GATEWAY_CONFIG` | Path of the configuration file. |
 | The variable named by a backend's `api_key_env` | That backend's API key. |
 | `TYPESAFE_API_KEY` | The TypeSafe key, but only when the file has no `[[backend]]` block (see below). |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Base URL of an OTLP/HTTP collector, used only when `tracing.otlp_endpoint` is not set. See [`[tracing]`](#tracing). |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | The same for traces only, as a full URL. It wins over the variable above. |
+| `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_TIMEOUT` | Read by the OTLP exporter itself, for example to send an API key to a hosted collector. Their `OTEL_EXPORTER_OTLP_TRACES_*` forms work too. |
 | `RUST_LOG` | Log level and filters, in the [`tracing-subscriber` syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html). Defaults to `info`. |
 
 ## File layout
@@ -38,6 +41,7 @@ Environment variables the gateway reads:
 [server]          # listeners, timeouts, logging
 [[backend]]       # one block per model provider; repeat as needed
 [coalescing]      # merging of calls that share a state
+[tracing]         # OpenTelemetry traces, off unless an endpoint is set
 [[service]]       # one block per calling service; at least one is required
 ```
 
@@ -141,6 +145,32 @@ These settings apply to every backend. `max_request_tokens` and
 sends one request per question, but it still forms batches under the same
 limits, so they cap the size of a batch there too.
 
+## `[tracing]`
+
+Distributed traces, exported over OTLP. Off unless an endpoint is set. See
+[Traces](operations.md#traces) for what the gateway records.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `otlp_endpoint` | URL (`http` or `https`) | unset | Base URL of an OTLP/HTTP collector, such as `http://localhost:4318`. The gateway posts to `<otlp_endpoint>/v1/traces`. Unset turns tracing off, unless the environment names an endpoint (below). The collector must speak OTLP over HTTP with protobuf, usually on port 4318: gRPC (port 4317) is not supported. |
+| `service_name` | string | `"systemone-gateway"` | The `service.name` of the exported spans, which is how the gateway appears in the tracing backend. |
+| `sample_ratio` | number, 0 to 1 | `1.0` | Share of the traces the gateway starts that are kept. A call that arrives with a `traceparent` follows its caller's sampling decision instead, so this applies only to calls that arrive without one. |
+
+The endpoint is taken from the first of these that is set:
+
+1. `tracing.otlp_endpoint` in the file, a base URL to which `/v1/traces` is added.
+2. The `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` variable, a full URL used as it is.
+3. The `OTEL_EXPORTER_OTLP_ENDPOINT` variable, a base URL like the file's.
+
+The file wins, as a setting made in code does everywhere in OpenTelemetry. An
+empty variable counts as unset. With none of the three set, no exporter is
+created, the gateway neither reads nor sends a `traceparent`, and the spans cost
+next to nothing. `check-config` prints the endpoint `serve` would use.
+
+The file has no key for headers, timeouts or compression. Use
+`OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_TIMEOUT` and the like, which
+the exporter reads itself.
+
 ## `[[service]]`
 
 One block per calling service. At least one is required.
@@ -170,6 +200,8 @@ it is later refused upstream.
 - a model pattern is empty or has a `*` anywhere but the end;
 - two backends list the same model entry;
 - a rate, a timeout or a size that must be positive is zero;
+- `tracing.otlp_endpoint` is not an `http` or `https` URL, `tracing.service_name`
+  is empty, or `tracing.sample_ratio` is outside 0 to 1;
 - a backend's `max_queue_wait_ms` is not smaller than `server.request_timeout_ms`;
 - a service has no `key_sha256`, a hash that is not 64 hexadecimal characters,
   or a hash shared with another service;
