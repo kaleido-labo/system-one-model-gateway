@@ -11,14 +11,14 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 use crate::config::{ModelPattern, ServiceConfig, best_match, parse_all};
-use crate::scheduling::Gcra;
+use crate::scheduling::{Limiter, Limiters};
 
 pub type ServiceId = usize;
 
 pub struct Service {
     pub name: String,
     allowed_models: Option<Vec<ModelPattern>>,
-    rate: Option<Gcra>,
+    rate: Option<Limiter>,
     in_flight: Option<Arc<Semaphore>>,
 }
 
@@ -37,7 +37,7 @@ pub struct Admission {
 }
 
 impl Service {
-    fn from_config(config: &ServiceConfig) -> Self {
+    fn from_config(config: &ServiceConfig, limiters: &Limiters) -> Self {
         Self {
             name: config.name.clone(),
             allowed_models: config
@@ -47,7 +47,15 @@ impl Service {
             rate: config
                 .requests_per_minute
                 .zip(config.burst())
-                .map(|(rpm, burst)| Gcra::per_minute(f64::from(rpm), u64::from(burst))),
+                .map(|(rpm, burst)| {
+                    limiters.per_minute(
+                        &format!("service:{}:requests", config.name),
+                        f64::from(rpm),
+                        u64::from(burst),
+                    )
+                }),
+            // In flight calls are counted per process, even with a shared
+            // rate: a slot is held by a call running in this process.
             in_flight: config.max_concurrent.map(|n| Arc::new(Semaphore::new(n))),
         }
     }
@@ -58,7 +66,7 @@ impl Service {
             .is_none_or(|models| best_match(models, model).is_some())
     }
 
-    pub fn admit(&self, now: Instant) -> Result<Admission, Refusal> {
+    pub async fn admit(&self, now: Instant) -> Result<Admission, Refusal> {
         // Take the in-flight slot first, so a call refused for concurrency
         // does not also spend the service's rate budget.
         let in_flight = match &self.in_flight {
@@ -71,6 +79,7 @@ impl Service {
         };
         if let Some(rate) = &self.rate {
             rate.try_book(now, 1, Duration::ZERO)
+                .await
                 .map_err(|retry_after| Refusal::RateLimited { retry_after })?;
         }
         Ok(Admission {
@@ -86,7 +95,7 @@ pub struct ServiceRegistry {
 
 impl ServiceRegistry {
     /// Builds the registry from configuration that already passed validation.
-    pub fn from_config(configs: &[ServiceConfig]) -> Self {
+    pub fn from_config(configs: &[ServiceConfig], limiters: &Limiters) -> Self {
         let mut services = Vec::with_capacity(configs.len());
         let mut by_key_hash = HashMap::new();
         for (id, config) in configs.iter().enumerate() {
@@ -96,7 +105,7 @@ impl ServiceRegistry {
                     .expect("key hashes are checked by Config::validate");
                 by_key_hash.insert(digest, id);
             }
-            services.push(Service::from_config(config));
+            services.push(Service::from_config(config, limiters));
         }
         Self {
             services,
@@ -162,7 +171,10 @@ mod tests {
 
     #[test]
     fn authenticates_by_bearer_key() {
-        let registry = ServiceRegistry::from_config(&[config("a", "key-a"), config("b", "key-b")]);
+        let registry = ServiceRegistry::from_config(
+            &[config("a", "key-a"), config("b", "key-b")],
+            &Limiters::local(),
+        );
         assert_eq!(registry.authenticate(&headers("Bearer key-b")), Some(1));
         assert_eq!(registry.authenticate(&headers("bearer  key-a ")), Some(0));
         assert_eq!(registry.authenticate(&headers("Bearer key-c")), None);
@@ -184,28 +196,29 @@ mod tests {
     fn allowed_models_restrict_only_when_set() {
         let mut restricted = config("a", "k");
         restricted.allowed_models = Some(vec!["jev-latest".to_owned()]);
-        let registry = ServiceRegistry::from_config(&[restricted, config("b", "l")]);
+        let registry =
+            ServiceRegistry::from_config(&[restricted, config("b", "l")], &Limiters::local());
         assert!(registry.get(0).allows_model("jev-latest"));
         assert!(!registry.get(0).allows_model("jev-preview"));
         assert!(registry.get(1).allows_model("anything"));
 
         let mut family = config("c", "m");
         family.allowed_models = Some(vec!["Qwen/*".to_owned()]);
-        let registry = ServiceRegistry::from_config(&[family]);
+        let registry = ServiceRegistry::from_config(&[family], &Limiters::local());
         assert!(registry.get(0).allows_model("Qwen/Qwen2.5-7B-Instruct"));
         assert!(!registry.get(0).allows_model("jev-latest"));
     }
 
-    #[test]
-    fn admission_enforces_the_service_rate() {
+    #[tokio::test]
+    async fn admission_enforces_the_service_rate() {
         let mut limited = config("a", "k");
         limited.requests_per_minute = Some(60);
         limited.burst = Some(1);
-        let registry = ServiceRegistry::from_config(&[limited]);
+        let registry = ServiceRegistry::from_config(&[limited], &Limiters::local());
         let service = registry.get(0);
         let now = Instant::now();
-        let _first = service.admit(now).unwrap();
-        match service.admit(now) {
+        let _first = service.admit(now).await.unwrap();
+        match service.admit(now).await {
             Err(Refusal::RateLimited { retry_after }) => {
                 assert_eq!(retry_after, Duration::from_secs(1));
             }
@@ -213,18 +226,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn admission_enforces_the_in_flight_cap_until_dropped() {
+    #[tokio::test]
+    async fn admission_enforces_the_in_flight_cap_until_dropped() {
         let mut capped = config("a", "k");
         capped.max_concurrent = Some(1);
-        let registry = ServiceRegistry::from_config(&[capped]);
+        let registry = ServiceRegistry::from_config(&[capped], &Limiters::local());
         let service = registry.get(0);
-        let first = service.admit(Instant::now()).unwrap();
+        let first = service.admit(Instant::now()).await.unwrap();
         assert_eq!(
-            service.admit(Instant::now()).err(),
+            service.admit(Instant::now()).await.err(),
             Some(Refusal::TooManyInFlight)
         );
         drop(first);
-        assert!(service.admit(Instant::now()).is_ok());
+        assert!(service.admit(Instant::now()).await.is_ok());
     }
 }

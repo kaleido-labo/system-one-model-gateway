@@ -14,6 +14,7 @@ use crate::backend::Backends;
 use crate::config::{Config, millis};
 use crate::http::{AppState, Shared, admin_router, public_router};
 use crate::metrics::Metrics;
+use crate::scheduling::Limiters;
 use crate::services::ServiceRegistry;
 use crate::wire::TokenEstimator;
 
@@ -97,9 +98,10 @@ impl Gateway {
 
 fn build_state(config: &Config, env: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<AppState> {
     let metrics = Arc::new(Metrics::new());
+    let limiters = Limiters::from_config(config.cluster.as_ref(), env, &metrics)?;
     Ok(AppState::new(Shared {
-        registry: ServiceRegistry::from_config(&config.services),
-        backends: Backends::build(config, env, &metrics)?,
+        registry: ServiceRegistry::from_config(&config.services, &limiters),
+        backends: Backends::build(config, env, &limiters, &metrics)?,
         metrics,
         estimator: TokenEstimator::new(config.coalescing.bytes_per_token),
         request_timeout: millis(config.server.request_timeout_ms),

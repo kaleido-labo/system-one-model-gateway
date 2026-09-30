@@ -69,7 +69,7 @@ async fn handle_systemone(
         return GatewayError::invalid(invalid).into_response();
     }
     // Held until the answer is sent, so max_concurrent counts in-flight calls.
-    let _admission = match service.admit(arrived) {
+    let _admission = match service.admit(arrived).await {
         Ok(admission) => admission,
         Err(Refusal::RateLimited { retry_after }) => {
             return GatewayError::rate_limited(
@@ -93,8 +93,10 @@ async fn handle_systemone(
     let questions = request.questions.len() as u64;
     let deadline = arrived + state.request_timeout;
     let (reply, answer) = oneshot::channel();
-    if let Err(Saturated { retry_after }) =
-        backend.coalescer.submit(request, arrived, deadline, reply)
+    if let Err(Saturated { retry_after }) = backend
+        .coalescer
+        .submit(request, arrived, deadline, reply)
+        .await
     {
         return GatewayError::rate_limited(
             format!(

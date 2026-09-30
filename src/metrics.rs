@@ -52,6 +52,7 @@ pub struct Metrics {
     pub deduplicated_questions: Counter,
     pub estimated_tokens_saved: Counter,
     pub isolated_replays: Counter,
+    pub shared_limiter_errors: Counter,
     pub queue_wait: Histogram,
 }
 
@@ -138,6 +139,12 @@ impl Metrics {
             "Calls replayed on their own after the merged call they were in was rejected",
             isolated_replays.clone(),
         );
+        let shared_limiter_errors = Counter::default();
+        registry.register(
+            "shared_limiter_errors",
+            "Bookings on the shared rate limiter that failed because Redis was unreachable or too slow; each was paced on the replica's own share instead",
+            shared_limiter_errors.clone(),
+        );
         let queue_wait = latency_histogram();
         registry.register(
             "queue_wait_seconds",
@@ -159,6 +166,7 @@ impl Metrics {
             deduplicated_questions,
             estimated_tokens_saved,
             isolated_replays,
+            shared_limiter_errors,
             queue_wait,
         }
     }

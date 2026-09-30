@@ -1,25 +1,134 @@
 //! Pacing against rate limits with the generic cell rate algorithm (GCRA).
 //!
-//! One type covers the three limits the gateway enforces: upstream requests
-//! per minute, upstream tokens per second, and each service's own requests
-//! per minute. Booking never sleeps. It returns the instant the caller may
-//! start, and the caller decides whether to wait, to join a batch that
-//! already holds a slot, or to answer `429` with that instant as retry-after.
+//! One algorithm covers the three limits the gateway enforces: upstream
+//! requests per minute, upstream tokens per second, and each service's own
+//! requests per minute. Booking never sleeps. It returns the instant the
+//! caller may start, and the caller decides whether to wait, to join a batch
+//! that already holds a slot, or to answer `429` with that instant as
+//! retry-after.
+//!
+//! `Gcra` keeps the state in memory, per process. `Limiter` is what the rest
+//! of the gateway holds: a `Gcra`, or a `Shared` one that keeps the same state
+//! in Redis so that every replica draws on one budget (see `shared`). Booking
+//! is async on both, because a shared booking is a round trip.
 
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use tokio::time::Instant;
 
+mod shared;
+
+pub use shared::{Limiters, Shared};
+
+/// A rate limit, kept in this process or shared between replicas.
+///
+/// The methods mirror `Gcra`'s. A shared limiter never fails a call because
+/// Redis does: it answers from a local `Gcra` holding this replica's share
+/// instead (see `Shared`).
+pub enum Limiter {
+    Local(Gcra),
+    Shared(Shared),
+}
+
+impl Limiter {
+    /// Books `cost` units if they can start within `max_wait`, and returns
+    /// when they start. Otherwise books nothing and returns how long the
+    /// caller would have had to wait.
+    pub async fn try_book(
+        &self,
+        now: Instant,
+        cost: u64,
+        max_wait: Duration,
+    ) -> Result<Instant, Duration> {
+        match self {
+            Self::Local(gcra) => gcra.try_book(now, cost, max_wait),
+            Self::Shared(shared) => shared.try_book(now, cost, max_wait).await,
+        }
+    }
+
+    /// `try_book` for a limiter that lives in this process, which needs no
+    /// await and so can run under a lock. `None` when booking needs Redis.
+    pub fn try_book_in_process(
+        &self,
+        now: Instant,
+        cost: u64,
+        max_wait: Duration,
+    ) -> Option<Result<Instant, Duration>> {
+        match self {
+            Self::Local(gcra) => Some(gcra.try_book(now, cost, max_wait)),
+            Self::Shared(_) => None,
+        }
+    }
+
+    /// Books `cost` units however long they have to wait.
+    pub async fn book(&self, now: Instant, cost: u64) -> Instant {
+        match self {
+            Self::Local(gcra) => gcra.book(now, cost),
+            Self::Shared(shared) => shared.book(now, cost).await,
+        }
+    }
+
+    /// Corrects an earlier booking once the real cost is known: a positive
+    /// `delta` charges more units, a negative one gives units back.
+    pub async fn adjust(&self, delta: i64) {
+        match self {
+            Self::Local(gcra) => gcra.adjust(delta),
+            Self::Shared(shared) => shared.adjust(delta).await,
+        }
+    }
+
+    /// Holds every start until `until`, then resumes without a burst.
+    pub async fn pause_until(&self, until: Instant) {
+        match self {
+            Self::Local(gcra) => gcra.pause_until(until),
+            Self::Shared(shared) => shared.pause_until(until).await,
+        }
+    }
+
+    /// When a pause set by `pause_until` ends, if one is still running.
+    pub async fn resume_at(&self, now: Instant) -> Option<Instant> {
+        match self {
+            Self::Local(gcra) => gcra.resume_at(now),
+            Self::Shared(shared) => shared.resume_at(now).await,
+        }
+    }
+
+    /// How long a one-unit booking made now would wait.
+    pub async fn backlog(&self, now: Instant) -> Duration {
+        match self {
+            Self::Local(gcra) => gcra.backlog(now),
+            Self::Shared(shared) => shared.backlog(now).await,
+        }
+    }
+
+    /// Changes the sustained rate from now on, keeping what is already
+    /// booked. Nothing calls it yet; it is here for the adaptive rate that
+    /// will raise and lower a backend's limit while the gateway runs.
+    ///
+    /// A shared limiter applies the new rate to the bookings this replica
+    /// makes. Redis holds times, not a rate, so replicas that disagree on the
+    /// rate simply each book with their own.
+    #[allow(dead_code, reason = "for the adaptive rate, which lands separately")]
+    pub fn set_rate(&self, per_second: f64) {
+        match self {
+            Self::Local(gcra) => gcra.set_rate(per_second),
+            Self::Shared(shared) => shared.set_rate(per_second),
+        }
+    }
+}
+
 pub struct Gcra {
-    /// Time one unit of cost occupies at the sustained rate.
-    emission: Duration,
     /// Units that may go back to back before pacing starts.
     burst: u64,
     state: Mutex<State>,
 }
 
 struct State {
+    /// Time one unit of cost occupies at the sustained rate. It sits with
+    /// the rest of the state so that a change of rate cannot land in the
+    /// middle of a booking.
+    emission: Duration,
     /// Theoretical arrival time: when the bucket would be full again.
     tat: Instant,
     /// Set after the vendor answered 429; nothing may start before it.
@@ -31,9 +140,9 @@ impl Gcra {
     pub fn per_second(per_second: f64, burst: u64) -> Self {
         assert!(per_second > 0.0, "rate must be positive");
         Self {
-            emission: Duration::from_secs_f64(1.0 / per_second),
             burst: burst.max(1),
             state: Mutex::new(State {
+                emission: Duration::from_secs_f64(1.0 / per_second),
                 tat: Instant::now(),
                 paused_until: None,
             }),
@@ -42,6 +151,13 @@ impl Gcra {
 
     pub fn per_minute(per_minute: f64, burst: u64) -> Self {
         Self::per_second(per_minute / 60.0, burst)
+    }
+
+    /// Changes the sustained rate from now on. What is already booked keeps
+    /// its place: only the units booked after this call cost the new amount.
+    pub fn set_rate(&self, per_second: f64) {
+        assert!(per_second > 0.0, "rate must be positive");
+        self.lock().emission = Duration::from_secs_f64(1.0 / per_second);
     }
 
     /// Books `cost` units if they can start within `max_wait`, and returns
@@ -75,7 +191,7 @@ impl Gcra {
     /// `delta` charges more units, a negative one gives units back.
     pub fn adjust(&self, delta: i64) {
         let mut state = self.lock();
-        let shift = self.emission_for(delta.unsigned_abs());
+        let shift = emission_for(state.emission, delta.unsigned_abs());
         state.tat = if delta >= 0 {
             state.tat + shift
         } else {
@@ -91,8 +207,8 @@ impl Gcra {
         if state.paused_until.is_none_or(|current| current < until) {
             state.paused_until = Some(until);
         }
-        let capacity = self.emission_for(self.burst);
-        let no_burst = until + capacity.saturating_sub(self.emission);
+        let capacity = emission_for(state.emission, self.burst);
+        let no_burst = until + capacity.saturating_sub(state.emission);
         state.tat = state.tat.max(no_burst);
     }
 
@@ -112,8 +228,8 @@ impl Gcra {
     /// them, and never during a pause. A cost above the burst waits for a
     /// full bucket and then overdraws it.
     fn start_for(&self, state: &State, now: Instant, cost: u64) -> Instant {
-        let capacity = self.emission_for(self.burst);
-        let room_needed = self.emission_for(cost.min(self.burst));
+        let capacity = emission_for(state.emission, self.burst);
+        let room_needed = emission_for(state.emission, cost.min(self.burst));
         let start = (state.tat + room_needed)
             .checked_sub(capacity)
             .map_or(now, |start| start.max(now));
@@ -124,12 +240,7 @@ impl Gcra {
     }
 
     fn commit(&self, state: &mut State, start: Instant, cost: u64) {
-        state.tat = state.tat.max(start) + self.emission_for(cost);
-    }
-
-    fn emission_for(&self, units: u64) -> Duration {
-        let nanos = self.emission.as_nanos().saturating_mul(u128::from(units));
-        Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+        state.tat = state.tat.max(start) + emission_for(state.emission, cost);
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -138,6 +249,12 @@ impl Gcra {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+/// Time `units` of cost occupy at a rate where one unit takes `emission`.
+fn emission_for(emission: Duration, units: u64) -> Duration {
+    let nanos = emission.as_nanos().saturating_mul(u128::from(units));
+    Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]
@@ -222,6 +339,20 @@ mod tests {
         assert_eq!(gcra.book(t0, 1), t0 + ms(500));
         assert_eq!(gcra.book(t0, 1), t0 + ms(550));
         assert_eq!(gcra.resume_at(t0 + ms(600)), None);
+    }
+
+    #[test]
+    fn a_new_rate_applies_to_what_is_booked_after_it() {
+        let gcra = Gcra::per_second(10.0, 1);
+        let t0 = Instant::now();
+        assert_eq!(gcra.book(t0, 1), t0);
+        // Booked at 10 per second: the next slot is 100 ms away.
+        assert_eq!(gcra.backlog(t0), ms(100));
+        gcra.set_rate(100.0);
+        // The booking already made keeps its place; later ones cost 10 ms.
+        assert_eq!(gcra.backlog(t0), ms(100));
+        assert_eq!(gcra.book(t0, 1), t0 + ms(100));
+        assert_eq!(gcra.book(t0, 1), t0 + ms(110));
     }
 
     #[test]
