@@ -9,11 +9,8 @@ use common::{Harness, Scripted, Setup};
 use serde_json::{Value, json};
 use tokio::time::sleep;
 
-/// The harness has no slot for a `[cache]` table, and `coalescing` is the
-/// last table before the services, so the cache rides along there.
-const CACHE_ON: &str =
-    "window_ms = 150\n[cache]\nenabled = true\nttl_ms = 60000\nmax_entries = 100";
-const CACHE_SHORT_TTL: &str = "window_ms = 150\n[cache]\nenabled = true\nttl_ms = 200";
+const CACHE_ON: &str = "enabled = true\nttl_ms = 60000\nmax_entries = 100";
+const CACHE_SHORT_TTL: &str = "enabled = true\nttl_ms = 200";
 
 fn noul(instructions: &str) -> Value {
     json!({"type": "noul", "instructions": instructions})
@@ -25,7 +22,7 @@ fn call_body(state: &str, questions: Value) -> Value {
 
 fn cached() -> Setup {
     Setup {
-        coalescing: CACHE_ON,
+        cache: Some(CACHE_ON),
         ..Setup::default()
     }
 }
@@ -277,7 +274,7 @@ async fn errors_are_never_cached() {
 #[tokio::test]
 async fn an_answer_is_dropped_when_its_ttl_passes() {
     let h = Harness::start(Setup {
-        coalescing: CACHE_SHORT_TTL,
+        cache: Some(CACHE_SHORT_TTL),
         ..Setup::default()
     })
     .await;
@@ -330,7 +327,7 @@ async fn a_merged_call_fills_the_cache_for_each_of_its_questions() {
 #[tokio::test]
 async fn a_backend_can_opt_out_of_the_cache() {
     let h = Harness::start(Setup {
-        coalescing: CACHE_ON,
+        cache: Some(CACHE_ON),
         upstream: "cache = false",
         ..Setup::default()
     })
@@ -352,7 +349,7 @@ async fn a_backend_can_opt_out_of_the_cache() {
 #[tokio::test]
 async fn a_chat_backend_is_cached_like_any_other() {
     let h = Harness::start(Setup {
-        coalescing: CACHE_ON,
+        cache: Some(CACHE_ON),
         chat: Some(""),
         ..Setup::default()
     })
@@ -374,7 +371,7 @@ async fn a_chat_backend_is_cached_like_any_other() {
 #[tokio::test]
 async fn a_hit_is_still_checked_and_counted_against_the_service() {
     let h = Harness::start(Setup {
-        coalescing: CACHE_ON,
+        cache: Some(CACHE_ON),
         services: vec![
             ("ocr", "key-ocr", ""),
             (

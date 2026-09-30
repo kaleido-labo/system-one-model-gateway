@@ -28,6 +28,9 @@ pub struct Setup {
     /// `None` leaves the chat backend out.
     pub chat: Option<&'static str>,
     pub coalescing: &'static str,
+    /// Lines of a `[cache]` table. `None` leaves the table out, so the cache
+    /// is off.
+    pub cache: Option<&'static str>,
     /// (name, key, extra lines for its [[service]] block)
     pub services: Vec<(&'static str, &'static str, &'static str)>,
     /// The key the gateway presents to the mock, on both backends.
@@ -45,6 +48,7 @@ impl Default for Setup {
             chat: None,
             // Wide enough that calls fired together always land in one batch.
             coalescing: "window_ms = 150",
+            cache: None,
             services: vec![
                 ("ocr", "key-ocr", ""),
                 ("fraud", "key-fraud", ""),
@@ -106,6 +110,9 @@ pub fn config_text(setup: &Setup, url: &str) -> String {
         ));
     }
     toml.push_str(&format!("[coalescing]\n{}\n", setup.coalescing));
+    if let Some(cache) = setup.cache {
+        toml.push_str(&format!("[cache]\n{cache}\n"));
+    }
     for (name, key, extra) in &setup.services {
         toml.push_str(&format!(
             "[[service]]\nname = \"{name}\"\nkey_sha256 = [\"{}\"]\n{extra}\n",
