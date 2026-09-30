@@ -1,33 +1,38 @@
-//! HTTP handlers: the TypeSafe-compatible public API and the admin endpoints.
+//! The HTTP surface: the TypeSafe-compatible public API and the admin endpoints.
 //!
 //! Whatever backend answers, services see TypeSafe's API: the same request,
 //! the same answers, the same errors.
+//!
+//! This file holds the routers, the shared state and what every handler uses
+//! to build a response. The two public endpoints live in `systemone` and
+//! `models`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axum::Router;
-use axum::body::{Body, Bytes};
+use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use tokio::sync::oneshot;
-use tokio::time::{Instant, timeout_at};
 use tower_http::LatencyUnit;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
-use tracing::{Level, Span};
+use tracing::Level;
 
 use crate::backend::{Backends, REQUEST_ID};
 use crate::error::{GatewayError, insert_retry_after};
-use crate::metrics::{CallLabels, Metrics};
-use crate::scheduling::{Outcome, Saturated};
-use crate::services::{Refusal, ServiceId, ServiceRegistry};
-use crate::wire::{Invalid, PreparedRequest, RequestError, TokenEstimator};
+use crate::metrics::Metrics;
+use crate::scheduling::Outcome;
+use crate::services::ServiceRegistry;
+use crate::wire::TokenEstimator;
+
+mod models;
+mod systemone;
 
 /// How many calls shared the upstream call that answered this one.
 pub const BATCH_CALLERS: HeaderName = HeaderName::from_static("x-systemone-gateway-batch-callers");
@@ -58,8 +63,8 @@ impl AppState {
 
 pub fn public_router(state: AppState, max_body_bytes: usize) -> Router {
     Router::new()
-        .route("/v1/systemone", post(systemone))
-        .route("/v1/models", get(models))
+        .route("/v1/systemone", post(systemone::systemone))
+        .route("/v1/models", get(models::models))
         .fallback(not_found)
         .layer(DefaultBodyLimit::max(max_body_bytes))
         .layer(CatchPanicLayer::new())
@@ -99,113 +104,6 @@ pub fn admin_router(state: AppState) -> Router {
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
         .with_state(state)
-}
-
-async fn systemone(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    let arrived = Instant::now();
-    let Some(service_id) = state.0.registry.authenticate(&headers) else {
-        record_call(&state.0.metrics, "-", StatusCode::UNAUTHORIZED, arrived);
-        return GatewayError::unauthorized().into_response();
-    };
-    let service = state.0.registry.get(service_id);
-    Span::current().record("service", service.name.as_str());
-    let response = handle_systemone(&state.0, service_id, &body, arrived).await;
-    record_call(&state.0.metrics, &service.name, response.status(), arrived);
-    response
-}
-
-async fn handle_systemone(
-    state: &Shared,
-    service_id: ServiceId,
-    body: &[u8],
-    arrived: Instant,
-) -> Response {
-    let service = state.registry.get(service_id);
-    let request = match PreparedRequest::parse(body, &state.estimator) {
-        Ok(request) => request,
-        Err(RequestError::Malformed(message)) => {
-            return GatewayError::malformed(message).into_response();
-        }
-        Err(RequestError::Invalid(invalid)) => {
-            return GatewayError::invalid(invalid).into_response();
-        }
-    };
-    if !service.allows_model(&request.model) {
-        return GatewayError::model_not_allowed(&request.model).into_response();
-    }
-    let Some(backend) = state.backends.route(&request.model) else {
-        return GatewayError::invalid(Invalid::new(
-            "model",
-            format!(
-                "{:?} is not served by any backend of this gateway",
-                request.model
-            ),
-        ))
-        .into_response();
-    };
-    if let Err(invalid) = backend.check(&request) {
-        return GatewayError::invalid(invalid).into_response();
-    }
-    // Held until the answer is sent, so max_concurrent counts in-flight calls.
-    let _admission = match service.admit(arrived) {
-        Ok(admission) => admission,
-        Err(Refusal::RateLimited { retry_after }) => {
-            return GatewayError::rate_limited(
-                format!("service {:?} is over its requests_per_minute", service.name),
-                retry_after,
-            )
-            .into_response();
-        }
-        Err(Refusal::TooManyInFlight) => {
-            return GatewayError::rate_limited(
-                format!(
-                    "service {:?} already has max_concurrent calls in flight",
-                    service.name
-                ),
-                Duration::from_secs(1),
-            )
-            .into_response();
-        }
-    };
-
-    let questions = request.questions.len() as u64;
-    let deadline = arrived + state.request_timeout;
-    let (reply, answer) = oneshot::channel();
-    if let Err(Saturated { retry_after }) =
-        backend.coalescer.submit(request, arrived, deadline, reply)
-    {
-        return GatewayError::rate_limited(
-            format!(
-                "backend {:?}'s shared quota is booked beyond max_queue_wait_ms; retry later",
-                backend.name
-            ),
-            retry_after,
-        )
-        .into_response();
-    }
-    state
-        .metrics
-        .questions
-        .get_or_create(&Metrics::service(&service.name))
-        .inc_by(questions);
-
-    match timeout_at(deadline, answer).await {
-        Ok(Ok(outcome)) => {
-            let mut response = outcome_response(state, &service.name, &backend.name, outcome);
-            if let Ok(value) = HeaderValue::from_str(&backend.name) {
-                response.headers_mut().insert(BACKEND, value);
-            }
-            response
-        }
-        Ok(Err(_)) => {
-            GatewayError::internal("the batch carrying this call was dropped").into_response()
-        }
-        Err(_) => GatewayError::timeout(format!(
-            "no answer within request_timeout_ms ({} ms)",
-            state.request_timeout.as_millis()
-        ))
-        .into_response(),
-    }
 }
 
 fn outcome_response(state: &Shared, service: &str, backend: &str, outcome: Outcome) -> Response {
@@ -250,49 +148,6 @@ fn json_headers(request_id: Option<&str>) -> HeaderMap {
         headers.insert(REQUEST_ID, value);
     }
     headers
-}
-
-fn record_call(metrics: &Metrics, service: &str, status: StatusCode, arrived: Instant) {
-    metrics
-        .calls
-        .get_or_create(&CallLabels {
-            service: service.to_owned(),
-            status: status.as_u16(),
-        })
-        .inc();
-    metrics
-        .call_duration
-        .get_or_create(&Metrics::service(service))
-        .observe(arrived.elapsed().as_secs_f64());
-}
-
-/// `GET /v1/models`: the models of every backend, in configuration order.
-/// A System One backend's own list is served from memory for
-/// `models_cache_ttl_ms`; a chat backend lists the exact names it serves.
-async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let state = &state.0;
-    if state.registry.authenticate(&headers).is_none() {
-        return GatewayError::unauthorized().into_response();
-    }
-    let deadline = Instant::now() + state.request_timeout;
-    let mut entries = Vec::new();
-    for backend in state.backends.iter() {
-        match backend.list_models(deadline).await {
-            Ok(list) => entries.extend(list),
-            Err(outcome) => return outcome_response(state, "-", &backend.name, outcome),
-        }
-    }
-    let mut list = String::from("[");
-    for (index, entry) in entries.iter().enumerate() {
-        if index > 0 {
-            list.push(',');
-        }
-        list.push_str(entry.get());
-    }
-    list.push(']');
-    let mut body = crate::wire::ObjectWriter::with_capacity(list.len() + 12);
-    body.field("models", &list);
-    (StatusCode::OK, json_headers(None), body.finish()).into_response()
 }
 
 async fn not_found(method: Method, uri: Uri) -> Response {
