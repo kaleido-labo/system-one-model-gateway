@@ -83,6 +83,14 @@ fn check_config(path: PathBuf) -> anyhow::Result<()> {
             backend.requests_per_minute,
         );
     }
+    match &config.cluster {
+        None => println!("cluster: none, pacing stays in this process"),
+        Some(cluster) => println!(
+            "cluster: pacing shared through Redis (URL from ${}), key prefix {}, \
+             {} replica(s) assumed while Redis is down",
+            cluster.redis_url_env, cluster.key_prefix, cluster.expected_replicas
+        ),
+    }
     match config.coalescing.window_ms {
         0 => println!("merging: off"),
         window => println!("merging: calls sharing a state within {window} ms go out together"),
