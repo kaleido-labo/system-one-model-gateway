@@ -230,6 +230,59 @@ Callers that timed out or hung up before this point are dropped from the batch,
 so they are not paid for. If nobody is left, the batch gives its request slot
 back.
 
+### Adaptive rate
+
+A backend's `requests_per_minute` is what you believe the provider allows, and
+providers move their limits without notice. With `adaptive_rate = true` the
+gateway keeps that number as a ceiling and finds the real limit the way TCP
+finds a link's capacity, by additive increase and multiplicative decrease:
+
+- **Decrease.** A 429 from the backend multiplies the request rate by
+  `adaptive_decrease` (0.7 by default), never below
+  `adaptive_min_requests_per_minute`.
+- **Increase.** Every `adaptive_recovery_ms` without a 429 adds
+  `adaptive_increase_per_minute` back, never above `requests_per_minute`. The
+  steps are a fixed distance apart, so a rate that fell to the floor takes
+  (ceiling - floor) / step intervals to come back, 18 with the defaults of
+  1200 and 10 s, which is three minutes.
+
+The new rate goes to the same request pacer that every batch, retry and chat
+question books against, so it applies to all of them at once, with the
+limiter kept in memory or in Redis. What is already booked keeps its slot; the
+bookings that follow are spaced at the new rate. A chat backend needs nothing
+more: each question is a booking, and each question's 429 reports like any
+other.
+
+**One decrease per episode.** An overload makes many 429s at once: every batch
+and retry already in flight hits the limit before the first answer comes back,
+and a chat batch sends one request per question. Dividing the rate for each of
+them would send it to the floor on a single hiccup. So the first 429 lowers the
+rate and opens an *episode* that lasts `adaptive_recovery_ms`. A 429 inside the
+episode lowers nothing, but it restarts the recovery clock, since the provider
+is still saying no. A 429 after the episode lowers the rate again: if the
+provider is still refusing one interval after the last decrease, the lowered
+rate is still too high. A sustained overload therefore brings the rate down by
+one factor every `adaptive_recovery_ms`, not by one factor per request.
+
+The episode is as long as the recovery interval, not as long as the pause that
+follows a 429 (see [Retries and backoff](#retries-and-backoff)). The pause is
+how long the provider asked for silence, which can be a second or a minute. The
+episode has to cover the time it takes answers to come back from calls that
+were sent before the decrease, and that is set by latency, not by the pause.
+The default of 10 s covers a normal attempt, but `attempt_timeout_ms` (5 s)
+can be raised: if you raise it, raise `adaptive_recovery_ms` with it.
+
+Recovery is not driven by calls. A small task per adaptive backend wakes when
+the next step is due, so the rate rises while the gateway is idle too and the
+first call after a quiet hour finds the ceiling again. The adapted rate lives
+in memory: a restart begins again at the ceiling. `burst` does not change, and the services' own rates and
+`tokens_per_second` do not adapt.
+
+The current rate is the gauge `requests_per_minute_limit`, exported for every
+backend, and `rate_decreases_total` counts the episodes. The gateway logs one
+line when it lowers the rate and one when it is back at the ceiling. See
+[Operations](operations.md#tuning).
+
 ### Pacing across replicas
 
 By default the three limits live in memory, so each replica paces on its own.
@@ -282,6 +335,12 @@ account's limit, and stays inside the callers' deadline.
 A 429 from the backend pauses the whole backend: nothing starts until the pause
 ends. Without this, every batch would find the limit on its own. When the
 pause ends, batches leave one slot apart instead of together.
+
+With `adaptive_rate` on, the same 429 also lowers the backend's request rate,
+once per episode, so the batches that leave after the pause go out slower
+than the ones that were refused. Without it, the gateway backs off after every
+429 but keeps pacing at the configured rate. See
+[Adaptive rate](#adaptive-rate).
 
 Errors that are not retried, such as a 400 or a 403, go back to the caller as
 the backend sent them. A 401 from the backend is turned into a 502, because the

@@ -82,9 +82,10 @@ protocol does. Keys marked "chat only" or "System One only" are rejected on the
 other protocol, except where noted.
 
 A reload applies every key of a block. A backend whose block is unchanged keeps
-its queue, pacing and circuit breaker; one whose block changed, in any key, is
-built again and starts from scratch, and one that was removed takes no new
-calls. See [Reloading the configuration](operations.md#what-is-applied-and-what-needs-a-restart).
+its queue, pacing, circuit breaker and, with `adaptive_rate`, the rate it has
+adapted to; one whose block changed, in any key, is built again and starts from
+scratch (at its `requests_per_minute`, the ceiling), and one that was removed
+takes no new calls. See [Reloading the configuration](operations.md#what-is-applied-and-what-needs-a-restart).
 A new backend can only name an `api_key_env` variable that the process already
 has.
 
@@ -153,6 +154,42 @@ every replica the full limits. `max_concurrency` stays per process either way.
 The defaults are the gateway's own starting values, not a promise from any
 vendor. TypeSafe's limits change without notice (see
 [Operations](operations.md#tuning)); set these to what your account allows.
+
+### Adaptive rate
+
+Off by default. With `adaptive_rate = true`, `requests_per_minute` becomes a
+ceiling: the gateway lowers the backend's request rate when the backend answers
+429, and raises it again, step by step, while the backend stays quiet. See
+[Pace](architecture.md#adaptive-rate) for how it decides and
+[Operations](operations.md#tuning) for when to use it. `tokens_per_second` and
+the services' own rates do not adapt.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `adaptive_rate` | boolean | `false` | Turns the adaptive rate on for this backend. |
+| `adaptive_min_requests_per_minute` | integer, 1 to `requests_per_minute` | a tenth of `requests_per_minute`, at least 1 | The floor: the rate never goes below it, however many 429s come. |
+| `adaptive_decrease` | number, above 0 and below 1 | `0.7` | What one congestion episode multiplies the rate by. `0.5` halves it. |
+| `adaptive_increase_per_minute` | integer, 1 to `requests_per_minute` | a twentieth of `requests_per_minute`, at least 1 | Requests per minute added back at each recovery step. |
+| `adaptive_recovery_ms` | integer, > 0 | `10000` | How long without a 429 before each recovery step. It is also the length of an episode: 429s less than this far apart after a decrease lower the rate once, not again. |
+
+The three limits are checked even while `adaptive_rate` is off, so a typo shows
+up before anyone turns it on. `burst` is not scaled with the rate: it stays the
+number of requests that may go back to back. A chat backend adapts like any
+other, in questions per minute.
+
+```toml
+[[backend]]
+name = "typesafe"
+requests_per_minute = 1200        # the ceiling
+adaptive_rate = true
+adaptive_min_requests_per_minute = 120
+adaptive_decrease = 0.7           # 1200 -> 840 -> 588 -> ... down to 120
+adaptive_increase_per_minute = 60 # 10 s of quiet: +60 per minute, up to 1200
+adaptive_recovery_ms = 10000
+```
+
+With [`[cluster]`](#cluster), each replica adapts its own rate. See
+[Operations](operations.md#adaptive-rate-and-replicas).
 
 ### Timeouts and retries
 

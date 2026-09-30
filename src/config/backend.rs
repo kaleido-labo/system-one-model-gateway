@@ -57,6 +57,22 @@ pub struct BackendConfig {
     /// Requests that may leave back to back. Defaults to one second's worth.
     pub burst: Option<u32>,
     pub tokens_per_second: u32,
+    /// Treats `requests_per_minute` as a ceiling and lets the gateway lower the
+    /// backend's request rate when it answers 429, then raise it again step by
+    /// step (see `scheduling::aimd`). Off by default: the rate stays what the
+    /// operator wrote.
+    pub adaptive_rate: bool,
+    /// The lowest rate the gateway may adapt to. Unset means a tenth of
+    /// `requests_per_minute`, at least 1.
+    pub adaptive_min_requests_per_minute: Option<u32>,
+    /// What a 429 multiplies the rate by, between 0 and 1 exclusive.
+    pub adaptive_decrease: f64,
+    /// Requests per minute added back at each recovery step. Unset means a
+    /// twentieth of `requests_per_minute`, at least 1.
+    pub adaptive_increase_per_minute: Option<u32>,
+    /// How long without a 429 before each recovery step. It is also the length
+    /// of an episode: 429s closer together than this lower the rate once.
+    pub adaptive_recovery_ms: u64,
     /// Upstream calls in flight at once. For `chat`, one call is one merged
     /// batch, which sends a chat request per question.
     pub max_concurrency: usize,
@@ -109,6 +125,11 @@ impl Default for BackendConfig {
             requests_per_minute: 1_200,
             burst: None,
             tokens_per_second: 250_000,
+            adaptive_rate: false,
+            adaptive_min_requests_per_minute: None,
+            adaptive_decrease: 0.7,
+            adaptive_increase_per_minute: None,
+            adaptive_recovery_ms: 10_000,
             max_concurrency: 64,
             connect_timeout_ms: 2_000,
             attempt_timeout_ms: 5_000,
@@ -138,6 +159,20 @@ impl BackendConfig {
 
     pub fn burst(&self) -> u32 {
         self.burst.unwrap_or(self.requests_per_minute / 60).max(1)
+    }
+
+    /// The floor of the adaptive rate.
+    pub fn adaptive_min(&self) -> u32 {
+        self.adaptive_min_requests_per_minute
+            .unwrap_or(self.requests_per_minute / 10)
+            .max(1)
+    }
+
+    /// Requests per minute that one recovery step adds.
+    pub fn adaptive_step(&self) -> u32 {
+        self.adaptive_increase_per_minute
+            .unwrap_or(self.requests_per_minute / 20)
+            .max(1)
     }
 
     pub fn base_url(&self) -> &str {
@@ -203,6 +238,30 @@ impl BackendConfig {
         ensure!(
             self.requests_per_minute > 0,
             "backend {name:?}: requests_per_minute must be positive"
+        );
+        // Checked whether or not `adaptive_rate` is on, so that a typo shows
+        // up before someone turns it on.
+        ensure!(
+            self.adaptive_min_requests_per_minute
+                .is_none_or(|min| (1..=self.requests_per_minute).contains(&min)),
+            "backend {name:?}: adaptive_min_requests_per_minute must be between 1 and \
+             requests_per_minute ({})",
+            self.requests_per_minute
+        );
+        ensure!(
+            self.adaptive_decrease > 0.0 && self.adaptive_decrease < 1.0,
+            "backend {name:?}: adaptive_decrease must be greater than 0 and less than 1"
+        );
+        ensure!(
+            self.adaptive_increase_per_minute
+                .is_none_or(|step| (1..=self.requests_per_minute).contains(&step)),
+            "backend {name:?}: adaptive_increase_per_minute must be between 1 and \
+             requests_per_minute ({})",
+            self.requests_per_minute
+        );
+        ensure!(
+            self.adaptive_recovery_ms > 0,
+            "backend {name:?}: adaptive_recovery_ms must be positive"
         );
         ensure!(
             self.tokens_per_second > 0,

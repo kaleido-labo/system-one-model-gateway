@@ -106,12 +106,20 @@ fn check_config(path: PathBuf) -> anyhow::Result<()> {
             .map_or("no key".to_owned(), |variable| {
                 format!("key from ${variable}")
             });
+        let rate = if backend.adaptive_rate {
+            format!(
+                "{} requests/min at most, adapting down to {}",
+                backend.requests_per_minute,
+                backend.adaptive_min()
+            )
+        } else {
+            format!("{} requests/min", backend.requests_per_minute)
+        };
         println!(
-            "backend {}: {protocol} at {} for {}, {} requests/min, {key}",
+            "backend {}: {protocol} at {} for {}, {rate}, {key}",
             backend.name,
             backend.base_url(),
             backend.models.join(", "),
-            backend.requests_per_minute,
         );
     }
     match &config.server.admin_token_env {

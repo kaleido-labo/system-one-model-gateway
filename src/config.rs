@@ -780,4 +780,62 @@ mod tests {
         );
         assert!(Config::from_toml(&off).is_ok());
     }
+
+    #[test]
+    fn the_adaptive_rate_is_off_and_its_defaults_follow_the_configured_rate() {
+        let config = Config::from_toml(&with_service("")).unwrap();
+        let backend = &config.backends[0];
+        assert!(!backend.adaptive_rate);
+        assert_eq!(backend.adaptive_min(), 120);
+        assert_eq!(backend.adaptive_decrease, 0.7);
+        assert_eq!(backend.adaptive_step(), 60);
+        assert_eq!(backend.adaptive_recovery_ms, 10_000);
+
+        // Small rates still get a floor and a step of at least one request.
+        let small = format!(
+            "[[backend]]\nname = \"t\"\nrequests_per_minute = 5\nadaptive_rate = true\n{}",
+            with_service("")
+        );
+        let config = Config::from_toml(&small).unwrap();
+        assert_eq!(config.backends[0].adaptive_min(), 1);
+        assert_eq!(config.backends[0].adaptive_step(), 1);
+    }
+
+    #[test]
+    fn rejects_adaptive_settings_that_cannot_work() {
+        let backend =
+            |extra: &str| format!("[[backend]]\nname = \"t\"\nrequests_per_minute = 100\n{extra}");
+        for (extra, key) in [
+            (
+                "adaptive_min_requests_per_minute = 0",
+                "adaptive_min_requests_per_minute",
+            ),
+            (
+                "adaptive_min_requests_per_minute = 101",
+                "adaptive_min_requests_per_minute",
+            ),
+            ("adaptive_decrease = 0.0", "adaptive_decrease"),
+            ("adaptive_decrease = 1.0", "adaptive_decrease"),
+            ("adaptive_decrease = -0.5", "adaptive_decrease"),
+            (
+                "adaptive_increase_per_minute = 0",
+                "adaptive_increase_per_minute",
+            ),
+            (
+                "adaptive_increase_per_minute = 101",
+                "adaptive_increase_per_minute",
+            ),
+            ("adaptive_recovery_ms = 0", "adaptive_recovery_ms"),
+        ] {
+            let error = error_of(&backend(extra));
+            assert!(error.contains(key), "{extra}: {error}");
+        }
+        // The ceiling itself is a valid floor and a valid step.
+        let edge = format!(
+            "{}\n{}",
+            backend("adaptive_min_requests_per_minute = 100\nadaptive_increase_per_minute = 100"),
+            with_service("")
+        );
+        assert!(Config::from_toml(&edge).is_ok());
+    }
 }

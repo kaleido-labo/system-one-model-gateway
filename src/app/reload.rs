@@ -231,17 +231,17 @@ impl Reloader {
                 .flatten()
         });
 
-        // Building a backend resets its circuit gauge, and the gauge is
+        // Building a backend resets its circuit and rate gauges, and they are
         // shared with the backend it replaces. If a later step fails, that
-        // backend carries on, so its gauge goes back to what it was.
-        let gauges: Vec<(&str, i64)> = new
+        // backend carries on, so its gauges go back to what they were.
+        let gauges: Vec<(&str, i64, f64)> = new
             .backends
             .iter()
             .filter_map(|backend| {
-                let gauge = metrics
-                    .circuit_state
-                    .get(&Metrics::backend(&backend.name))?;
-                Some((backend.name.as_str(), gauge.get()))
+                let labels = Metrics::backend(&backend.name);
+                let circuit = metrics.circuit_state.get(&labels)?.get();
+                let rate = metrics.requests_per_minute_limit.get(&labels)?.get();
+                Some((backend.name.as_str(), circuit, rate))
             })
             .collect();
         let built = Backends::build_reusing(new, env, &self.0.limiters, metrics, |wanted| {
@@ -253,11 +253,13 @@ impl Reloader {
         let backends = match built {
             Ok(backends) => backends,
             Err(error) => {
-                for (name, value) in gauges {
+                for (name, circuit, rate) in gauges {
+                    let labels = Metrics::backend(name);
+                    metrics.circuit_state.get_or_create(&labels).set(circuit);
                     metrics
-                        .circuit_state
-                        .get_or_create(&Metrics::backend(name))
-                        .set(value);
+                        .requests_per_minute_limit
+                        .get_or_create(&labels)
+                        .set(rate);
                 }
                 return Err(error);
             }
@@ -296,9 +298,9 @@ impl Reloader {
                 reloaded.backends_removed.push(before.name.clone());
                 // A gauge is the state of something that is running; there
                 // is nothing left for it to describe.
-                metrics
-                    .circuit_state
-                    .remove(&Metrics::backend(&before.name));
+                let labels = Metrics::backend(&before.name);
+                metrics.circuit_state.remove(&labels);
+                metrics.requests_per_minute_limit.remove(&labels);
             }
         }
 
@@ -637,6 +639,11 @@ mod tests {
         let b_gauge = Metrics::backend("b");
         let metrics = Arc::clone(&state.snapshot().metrics);
         metrics.circuit_state.get_or_create(&b_gauge).set(2);
+        // And its rate is down to 420 from the default 1200.
+        metrics
+            .requests_per_minute_limit
+            .get_or_create(&b_gauge)
+            .set(420.0);
 
         // A new backend whose key is not in the environment: the whole
         // reload is refused, including the change to a service that is fine
@@ -660,6 +667,14 @@ mod tests {
         assert!(after.backends.named("c").is_none());
         assert!(Arc::ptr_eq(&a, &backend(&state, "a").unwrap()));
         assert_eq!(metrics.circuit_state.get_or_create(&b_gauge).get(), 2);
+        // And its rate, which building the new b reset to the ceiling.
+        assert_eq!(
+            metrics
+                .requests_per_minute_limit
+                .get_or_create(&b_gauge)
+                .get(),
+            420.0
+        );
 
         let text = after.metrics.render();
         assert!(
@@ -705,16 +720,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_circuit_gauge_goes_with_a_removed_backend() {
+    async fn the_gauges_go_with_a_removed_backend() {
         let services = service("s", "k", "");
         let (state, reloader) = running(&config("", BACKENDS, &services));
         let metrics = Arc::clone(&state.snapshot().metrics);
-        assert!(metrics.render().contains(r#"circuit_state{backend="b"}"#));
+        let text = metrics.render();
+        assert!(text.contains(r#"circuit_state{backend="b"}"#), "{text}");
+        assert!(
+            text.contains(r#"requests_per_minute_limit{backend="b"}"#),
+            "{text}"
+        );
         let only_a =
             "[[backend]]\nname = \"a\"\nmodels = [\"a-*\"]\nbase_url = \"http://127.0.0.1:1\"\n";
         reloader.reload(&config("", only_a, &services)).unwrap();
         let text = metrics.render();
         assert!(!text.contains(r#"circuit_state{backend="b"}"#), "{text}");
+        assert!(
+            !text.contains(r#"requests_per_minute_limit{backend="b"}"#),
+            "{text}"
+        );
         assert!(text.contains(r#"circuit_state{backend="a"}"#), "{text}");
+        assert!(
+            text.contains(r#"requests_per_minute_limit{backend="a"}"#),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reused_backend_keeps_its_adapted_rate_and_a_rebuilt_one_starts_at_its_ceiling() {
+        let services = service("s", "k", "");
+        let adaptive = BACKENDS.replacen(
+            "name = \"a\"",
+            "name = \"a\"\nadaptive_rate = true\nrequests_per_minute = 600",
+            1,
+        );
+        let (state, reloader) = running(&config("", &adaptive, &services));
+        let metrics = Arc::clone(&state.snapshot().metrics);
+        let labels = Metrics::backend("a");
+        let rate = || {
+            metrics
+                .requests_per_minute_limit
+                .get_or_create(&labels)
+                .get()
+        };
+        assert_eq!(rate(), 600.0);
+        let a = backend(&state, "a").unwrap();
+
+        // What the adapter does after a 429: the gauge shows the lowered rate.
+        metrics
+            .requests_per_minute_limit
+            .get_or_create(&labels)
+            .set(420.0);
+
+        // A reload that does not touch a leaves it as it is, adapter and rate.
+        reloader
+            .reload(&config("", &adaptive, &service("s", "k2", "")))
+            .unwrap();
+        assert!(Arc::ptr_eq(&a, &backend(&state, "a").unwrap()));
+        assert_eq!(rate(), 420.0);
+
+        // A change to a rebuilds it, at its ceiling.
+        let faster = adaptive.replace("requests_per_minute = 600", "requests_per_minute = 900");
+        let reloaded = reloader.reload(&config("", &faster, &services)).unwrap();
+        assert_eq!(reloaded.backends_built, ["a"]);
+        assert_eq!(rate(), 900.0);
     }
 }

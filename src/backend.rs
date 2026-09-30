@@ -10,6 +10,8 @@
 //!
 //! - `engine`: the protocol a backend speaks, System One or chat.
 //! - `upstream`: the HTTP client, with authentication, pacing and retries.
+//! - `adaptive`: the adaptive request rate, which lowers a backend's pacing
+//!   when it answers 429 and raises it again while it stays quiet.
 //! - `breaker`: the circuit breaker that turns calls away from a backend
 //!   that keeps failing, so they can go to its fallbacks.
 //! - `chat`: the chat protocol, which answers questions from token
@@ -26,14 +28,16 @@ use tokio::time::{Instant, sleep_until};
 use crate::config::{BackendConfig, Config, ModelPattern, Protocol, best_match, millis, parse_all};
 use crate::error::GatewayError;
 use crate::metrics::Metrics;
-use crate::scheduling::{BatchLimits, Coalescer, Dispatcher, Limiters, Outcome};
+use crate::scheduling::{BatchLimits, Coalescer, Dispatcher, Limiters, Outcome, Params};
 use crate::wire::{Invalid, PreparedRequest};
 
+mod adaptive;
 mod breaker;
 mod chat;
 mod engine;
 mod upstream;
 
+use adaptive::RateAdapter;
 pub use breaker::{CircuitBreaker, Verdict};
 use chat::ChatEngine;
 pub use engine::Engine;
@@ -95,7 +99,14 @@ impl Backend {
             f64::from(config.requests_per_minute),
             u64::from(config.burst()),
         ));
-        let upstream = Arc::new(Upstream::new(
+        // Exported for every backend, so that a dashboard shows the limit in
+        // force whether or not it adapts.
+        let requests_per_minute = f64::from(config.requests_per_minute);
+        metrics
+            .requests_per_minute_limit
+            .get_or_create(&Metrics::backend(name))
+            .set(requests_per_minute);
+        let mut upstream = Upstream::new(
             name,
             config.base_url(),
             api_key,
@@ -108,7 +119,22 @@ impl Backend {
             },
             Arc::clone(&pacer),
             Arc::clone(metrics),
-        )?);
+        )?;
+        if config.adaptive_rate {
+            upstream = upstream.with_rate_adapter(RateAdapter::start(
+                name,
+                Params {
+                    ceiling: requests_per_minute,
+                    floor: f64::from(config.adaptive_min()),
+                    decrease: config.adaptive_decrease,
+                    step: f64::from(config.adaptive_step()),
+                    recovery: millis(config.adaptive_recovery_ms),
+                },
+                Arc::clone(&pacer),
+                metrics,
+            ));
+        }
+        let upstream = Arc::new(upstream);
         let patterns = parse_all(&config.models);
         let (engine, models) = match config.protocol {
             Protocol::Systemone => (

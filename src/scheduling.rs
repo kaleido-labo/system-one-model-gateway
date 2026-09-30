@@ -12,13 +12,16 @@
 //!   per call, with each caller's share of the token usage.
 //!
 //! `limiter` holds the pacing all of them book against, in memory or shared
-//! between replicas through Redis.
+//! between replicas through Redis. `aimd` is the rule that raises and lowers a
+//! backend's request rate on it while the gateway runs.
 
+mod aimd;
 mod batch;
 mod coalescer;
 mod dispatch;
 mod limiter;
 
+pub use aimd::{Aimd, Change, Params};
 pub use coalescer::{BatchLimits, Coalescer, Saturated};
 pub use dispatch::{Dispatcher, MIN_RETRY_AFTER, Outcome};
 pub use limiter::{Limiter, Limiters};
