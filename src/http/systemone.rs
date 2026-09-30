@@ -14,11 +14,17 @@ use tokio::time::{Instant, timeout_at};
 use tracing::Span;
 
 use super::{AppState, BACKEND, CACHE, Shared, json_headers, outcome_response};
+use crate::backend::Backend;
 use crate::error::GatewayError;
 use crate::metrics::{CallLabels, Metrics};
-use crate::scheduling::Saturated;
+use crate::scheduling::{MIN_RETRY_AFTER, Outcome, Saturated};
 use crate::services::{Refusal, ServiceId};
 use crate::wire::{Invalid, PreparedRequest, RequestError};
+
+/// Least time a call must have left for a fallback to be worth trying after
+/// its backend failed. Less than that, and the fallback would only be
+/// answering a caller who has already been given a 504.
+const MIN_FALLBACK_BUDGET: Duration = Duration::from_secs(1);
 
 mod cached;
 
@@ -61,7 +67,7 @@ async fn handle_systemone(
     if !service.allows_model(&request.model) {
         return GatewayError::model_not_allowed(&request.model).into_response();
     }
-    let Some(backend) = state.backends.route(&request.model) else {
+    let Some(primary) = state.backends.route(&request.model) else {
         return GatewayError::invalid(Invalid::new(
             "model",
             format!(
@@ -71,7 +77,7 @@ async fn handle_systemone(
         ))
         .into_response();
     };
-    if let Err(invalid) = backend.check(&request) {
+    if let Err(invalid) = primary.check(&request) {
         return GatewayError::invalid(invalid).into_response();
     }
     // Held until the answer is sent, so max_concurrent counts in-flight calls.
@@ -99,16 +105,17 @@ async fn handle_systemone(
     let questions = request.questions.len() as u64;
     // Looked up only now: a call the service's limits refuse, or that is
     // invalid, never reads the cache. A hit still spends one request of the
-    // service's budget, but nothing of the backend's.
+    // service's budget, but nothing of the backend's. The routed backend
+    // decides whether the call uses the cache, even if a fallback answers.
     let reuse = state
         .cache
         .as_ref()
-        .filter(|_| backend.cached)
+        .filter(|_| primary.cached)
         .map(|cache| {
             Reuse::lookup(
                 cache,
                 &state.metrics,
-                &backend.name,
+                &primary.name,
                 &mut request,
                 wants_fresh(headers),
                 Instant::now(),
@@ -122,58 +129,164 @@ async fn handle_systemone(
             .inc_by(questions);
         let mut response_headers = json_headers(None);
         response_headers.insert(CACHE, HeaderValue::from_static(reuse.label()));
-        if let Ok(value) = HeaderValue::from_str(&backend.name) {
+        if let Ok(value) = HeaderValue::from_str(&primary.name) {
             response_headers.insert(BACKEND, value);
         }
         return (StatusCode::OK, response_headers, reuse.body()).into_response();
     }
 
     let deadline = arrived + state.request_timeout;
-    let (reply, answer) = oneshot::channel();
-    if let Err(Saturated { retry_after }) =
-        backend.coalescer.submit(request, arrived, deadline, reply)
-    {
-        return GatewayError::rate_limited(
-            format!(
-                "backend {:?}'s shared quota is booked beyond max_queue_wait_ms; retry later",
-                backend.name
-            ),
-            retry_after,
-        )
-        .into_response();
-    }
-    state
-        .metrics
-        .questions
-        .get_or_create(&Metrics::service(&service.name))
-        .inc_by(questions);
+    let chain = state.backends.chain(primary);
+    // Where to look for the next backend to try, the shortest wait among the
+    // breakers that turned the call away, and what the last backend that
+    // failed had to say.
+    let mut next = 0;
+    let mut wait: Option<Duration> = None;
+    let mut failed: Option<(&Backend, Outcome)> = None;
+    while let Some((index, backend)) = choose(&chain, next, &request, &mut wait) {
+        next = index + 1;
+        // The first backend gets the call as it arrived. A fallback gets it
+        // now: the queue deadline is about waiting for capacity there, and
+        // the time lost on the backend before does not count against it.
+        let queued_at = if index == 0 { arrived } else { Instant::now() };
+        if index > 0 {
+            state
+                .metrics
+                .fallback_calls
+                .get_or_create(&Metrics::fallback(&primary.name, &backend.name))
+                .inc();
+        }
+        let (reply, answer) = oneshot::channel();
+        if let Err(Saturated { retry_after }) = backend
+            .coalescer
+            .submit(request, queued_at, deadline, reply)
+        {
+            return GatewayError::rate_limited(
+                format!(
+                    "backend {:?}'s shared quota is booked beyond max_queue_wait_ms; retry later",
+                    backend.name
+                ),
+                retry_after,
+            )
+            .into_response();
+        }
+        if failed.is_none() {
+            state
+                .metrics
+                .questions
+                .get_or_create(&Metrics::service(&service.name))
+                .inc_by(questions);
+        }
 
-    match timeout_at(deadline, answer).await {
-        Ok(Ok(outcome)) => {
+        let outcome = match timeout_at(deadline, answer).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) => {
+                return GatewayError::internal("the batch carrying this call was dropped")
+                    .into_response();
+            }
+            Err(_) => {
+                return GatewayError::timeout(format!(
+                    "no answer within request_timeout_ms ({} ms)",
+                    state.request_timeout.as_millis()
+                ))
+                .into_response();
+            }
+        };
+        // A fallback is worth a try only if the backend is unavailable (not
+        // if it refused the call itself, which another backend would too),
+        // and if there is time for it to answer. Replaying the call is safe:
+        // a failed call gave the caller nothing, and System One calls change
+        // no state on the backend.
+        let has_time = deadline.saturating_duration_since(Instant::now()) >= MIN_FALLBACK_BUDGET;
+        if !(outcome.is_unavailable() && next < chain.len() && has_time) {
+            // Only the routed backend's answers are kept: a fallback's would
+            // otherwise stand in for the routed model's until they expire,
+            // long after that backend is back.
             let outcome = match &reuse {
-                Some(reuse) => reuse.absorb(outcome, Instant::now()),
+                Some(reuse) => reuse.absorb(outcome, index == 0, Instant::now()),
                 None => outcome,
             };
-            let mut response = outcome_response(state, &service.name, &backend.name, outcome);
-            if let Ok(value) = HeaderValue::from_str(&backend.name) {
-                response.headers_mut().insert(BACKEND, value);
-            }
+            let mut response = answer_with(state, &service.name, backend, outcome);
             if let Some(reuse) = reuse.filter(|_| response.status() == StatusCode::OK) {
                 response
                     .headers_mut()
                     .insert(CACHE, HeaderValue::from_static(reuse.label()));
             }
-            response
+            return response;
         }
-        Ok(Err(_)) => {
-            GatewayError::internal("the batch carrying this call was dropped").into_response()
+        // The request moved into the batch; read it again from the body, and
+        // take out the questions the cache answers once more.
+        request = match PreparedRequest::parse(body, &state.estimator) {
+            Ok(request) => request,
+            Err(_) => {
+                return GatewayError::internal("the request could not be read a second time")
+                    .into_response();
+            }
+        };
+        if let Some(reuse) = &reuse {
+            reuse.trim(&mut request);
         }
-        Err(_) => GatewayError::timeout(format!(
-            "no answer within request_timeout_ms ({} ms)",
-            state.request_timeout.as_millis()
-        ))
-        .into_response(),
+        failed = Some((backend, outcome));
     }
+
+    // Nobody is left to try. If a backend failed on the way, that is the
+    // answer; otherwise every breaker on the way was open.
+    match failed {
+        // A failure is passed on as it is, cached answers or not.
+        Some((backend, outcome)) => answer_with(state, &service.name, backend, outcome),
+        None => {
+            let retry_after = wait.unwrap_or(MIN_RETRY_AFTER);
+            let message = if chain.len() > 1 {
+                format!(
+                    "backend {:?} and its fallbacks are failing; their circuit breakers are open",
+                    primary.name
+                )
+            } else {
+                format!(
+                    "backend {:?} is failing; its circuit breaker is open",
+                    primary.name
+                )
+            };
+            GatewayError::unavailable(message, retry_after).into_response()
+        }
+    }
+}
+
+/// The first backend from `chain[from..]` that can take the call: the
+/// backend can express the request, and its circuit breaker lets a call
+/// through. A breaker that turns the call away adds its wait to `wait`, the
+/// shortest one being the `retry-after` when nobody is left.
+fn choose<'a>(
+    chain: &[&'a Backend],
+    from: usize,
+    request: &PreparedRequest,
+    wait: &mut Option<Duration>,
+) -> Option<(usize, &'a Backend)> {
+    for (index, backend) in chain.iter().enumerate().skip(from) {
+        // The routed backend's check came first and answered 422. A fallback
+        // that cannot express the request is skipped instead: the caller did
+        // nothing wrong.
+        if index > 0 && backend.check(request).is_err() {
+            continue;
+        }
+        match backend.breaker.admit(Instant::now()) {
+            Ok(()) => return Some((index, backend)),
+            Err(retry_after) => {
+                *wait = Some(wait.map_or(retry_after, |shortest| shortest.min(retry_after)));
+            }
+        }
+    }
+    None
+}
+
+/// The HTTP response for what `backend` answered, naming it in the
+/// `x-systemone-gateway-backend` header.
+fn answer_with(state: &Shared, service: &str, backend: &Backend, outcome: Outcome) -> Response {
+    let mut response = outcome_response(state, service, &backend.name, outcome);
+    if let Ok(value) = HeaderValue::from_str(&backend.name) {
+        response.headers_mut().insert(BACKEND, value);
+    }
+    response
 }
 
 fn record_call(metrics: &Metrics, service: &str, status: StatusCode, arrived: Instant) {

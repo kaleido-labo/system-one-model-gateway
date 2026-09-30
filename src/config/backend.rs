@@ -80,6 +80,17 @@ pub struct BackendConfig {
     /// differ from one call to the next, such as a chat model sampled at a
     /// temperature above zero.
     pub cache: bool,
+    /// Consecutive failed upstream calls (after retries) that open the
+    /// backend's circuit breaker. A failure is a network error, a 5xx
+    /// (529 included) or a 401 for the gateway's key. A 429 or a client
+    /// error is not one. 0 turns the breaker off.
+    pub circuit_breaker_failures: u32,
+    /// How long an open breaker turns calls away before it lets one trial
+    /// call through.
+    pub circuit_breaker_cooldown_ms: u64,
+    /// Backends that take over a call when this one is unavailable, in order
+    /// of preference. Empty means no fallback.
+    pub fallback: Vec<String>,
 }
 
 pub const TYPESAFE_URL: &str = "https://api.typesafe.ai";
@@ -107,6 +118,9 @@ impl Default for BackendConfig {
             max_queue_wait_ms: 2_000,
             models_cache_ttl_ms: 300_000,
             cache: true,
+            circuit_breaker_failures: 5,
+            circuit_breaker_cooldown_ms: 30_000,
+            fallback: Vec::new(),
         }
     }
 }
@@ -202,6 +216,21 @@ impl BackendConfig {
             self.attempt_timeout_ms > 0,
             "backend {name:?}: attempt_timeout_ms must be positive"
         );
+        ensure!(
+            self.circuit_breaker_failures == 0 || self.circuit_breaker_cooldown_ms > 0,
+            "backend {name:?}: circuit_breaker_cooldown_ms must be positive \
+             (or set circuit_breaker_failures = 0 to turn the breaker off)"
+        );
+        for (index, other) in self.fallback.iter().enumerate() {
+            ensure!(
+                other != name,
+                "backend {name:?}: fallback must not list the backend itself"
+            );
+            ensure!(
+                !self.fallback[..index].contains(other),
+                "backend {name:?}: fallback lists {other:?} twice"
+            );
+        }
         ensure!(
             self.max_queue_wait_ms < server.request_timeout_ms,
             "backend {name:?}: max_queue_wait_ms ({}) must be shorter than \

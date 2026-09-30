@@ -105,6 +105,17 @@ or a sub-table (`[backend.request_extras]`) placed right after its backend.
 | --- | --- | --- | --- |
 | `cache` | boolean | `true` | Lets the [answer cache](#cache) keep and serve this backend's answers. It does nothing while `[cache] enabled` is `false`. Set it to `false` for a backend whose answers should differ from one call to the next, such as a chat model sampled at a temperature above zero (`request_extras = { temperature = 0.7 }`). |
 
+### Circuit breaker and fallback
+
+See [Fallback and the circuit breaker](backends.md#fallback-and-the-circuit-breaker)
+for how they work together.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `circuit_breaker_failures` | integer | `5` | Failed upstream calls in a row that open the backend's breaker. A call fails when its final outcome, after the retries, is a network error or timeout, a 5xx (529 included), or a 401 (the backend refusing the gateway's key). A 429 or a client error (400, 403, 422...) is not a failure, because the backend answered. `0` turns the breaker off. |
+| `circuit_breaker_cooldown_ms` | integer, > 0 | `30000` | How long an open breaker turns calls away before it lets one trial call through. Ignored when `circuit_breaker_failures = 0`. |
+| `fallback` | list of backend names | empty | Backends that take over a call when this one is unavailable, in order of preference. Each name must be another `[[backend]]`, listed once, and the lists must not lead back to where they started. The fallback does not need to list the model in its `models`. |
+
 ### Limits and pacing
 
 These limits describe the backend and are shared by every service. They are
@@ -202,6 +213,9 @@ it is later refused upstream.
   `cache.max_entries` included;
 - `server.admin_token_env` is an empty name;
 - a backend's `max_queue_wait_ms` is not smaller than `server.request_timeout_ms`;
+- `circuit_breaker_cooldown_ms` is zero while the breaker is on;
+- a `fallback` names a backend that does not exist, names the backend itself,
+  lists a name twice, or leads back to a backend already in its chain;
 - a service has no `key_sha256`, a hash that is not 64 hexadecimal characters,
   or a hash shared with another service;
 - no `[[service]]` block exists, because nobody could call the gateway.

@@ -110,12 +110,12 @@ From a chat backend, answers are built by the gateway in TypeSafe's shape:
 
 | Header | Value |
 | --- | --- |
-| `x-systemone-gateway-backend` | Name of the backend that handled the call. Set on every outcome of a batch, success or error. Not set on errors decided before the call joined a batch (400, 401, 403, 422, a 429 for the service's own limits or a booked-out backend), nor on the 504 for `request_timeout_ms`. |
+| `x-systemone-gateway-backend` | Name of the backend that handled the call. When a [fallback](backends.md#fallback-and-the-circuit-breaker) took over, it is the fallback's name: the backend that actually answered, or the last one that failed. Set on every outcome of a batch, success or error. Not set on errors decided before the call joined a batch (400, 401, 403, 422, a 429 for the service's own limits or a booked-out backend, the 503 of an open circuit breaker), nor on the 504 for `request_timeout_ms`. |
 | `x-systemone-gateway-batch-callers` | How many service calls shared the upstream call that answered this one. `1` means the call went alone. Only on a `200`, and not when the [answer cache](#answer-cache) answered the whole call, because no upstream call was made. |
 | `x-systemone-gateway-cache` | Only when the answer cache is on for the backend that serves the model, and only on a `200`. `hit`: every answer came from the cache and nothing went upstream. `partial`: some did, and the others were asked upstream. `miss`: nothing came from the cache, including a call sent with `cache-control: no-cache`. |
 | `x-typesafe-request-id` | The backend's request id, for support requests. Not set on a `hit`, which made no backend call. It is the same for every caller of a merged call. For a chat backend, it is the first request id that its chat calls reported, read from the upstream `x-typesafe-request-id` or `x-request-id` header. |
 | `x-request-id` | The id of this call in the gateway's logs. The gateway uses the one in the request when there is one, and makes one otherwise. |
-| `retry-after`, `retry-after-ms` | On every 429 the gateway makes: how long to wait, in whole seconds (rounded up) and in milliseconds. The TypeSafe SDKs read `retry-after-ms` first. |
+| `retry-after`, `retry-after-ms` | On every 429 and 503 the gateway makes: how long to wait, in whole seconds (rounded up) and in milliseconds. The TypeSafe SDKs read `retry-after-ms` first. |
 
 ### Answer cache
 
@@ -199,6 +199,7 @@ against TypeSafe, and retry the same statuses (429 and 5xx) while honouring
 | 429 | `rate_limit_error` | See below. Always has `retry-after` and `retry-after-ms`. |
 | 500 | `internal_error` | The batch that carried the call was dropped. This is a gateway bug: report it. |
 | 502 | `upstream_error` | The backend is unreachable, refused the gateway's own key (the service's 401 is never the cause), sent a body the gateway cannot read or split, or, on a chat backend, answered with a first token that is no label or without logprobs. |
+| 503 | `unavailable_error` | The backend that serves the model keeps failing, and so does every fallback, so its circuit breaker turns the call away without sending it. Always has `retry-after` and `retry-after-ms`: the time left of the cool-down. See below. |
 | 504 | `timeout_error` | No answer within `request_timeout_ms`, or the backend did not answer an attempt in time after all retries. |
 
 A 429 from the gateway has one of these causes, and the `message` says which:
@@ -210,6 +211,13 @@ A 429 from the gateway has one of these causes, and the `message` says which:
 - every upstream connection stayed busy past `max_queue_wait_ms`;
 - the shared `tokens_per_second` budget is spent;
 - the backend asked everyone to back off and its pause outlasts the call.
+
+A 503 from the gateway means the circuit breaker of the backend (and of each of
+its fallbacks) is open after a run of failed calls. The call was not sent, so
+the answer is immediate and `retry-after` says when the breaker will let a trial
+call through. The TypeSafe SDKs retry 5xx statuses and honour `retry-after`.
+A 503 that a backend itself sent is a different case: it is passed through as
+described below.
 
 When a backend answers an error status that the gateway does not retry (400,
 403, 422...), or keeps answering 429, 500, 502, 503, 504 or 529 until the

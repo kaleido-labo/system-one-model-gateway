@@ -100,6 +100,16 @@ impl<'a> Reuse<'a> {
         }
     }
 
+    /// Takes the cached questions out of `request` again, for a request read
+    /// a second time from the body to go to a fallback backend.
+    pub(super) fn trim(&self, request: &mut PreparedRequest) {
+        request.questions.retain(|question| {
+            self.slots
+                .iter()
+                .any(|slot| slot.cached.is_none() && slot.id == question.id)
+        });
+    }
+
     fn hits(&self) -> usize {
         self.slots
             .iter()
@@ -150,10 +160,11 @@ impl<'a> Reuse<'a> {
     }
 
     /// Takes a backend's outcome for the questions that went upstream:
-    /// keeps its answers for later and, when some questions were served from
-    /// the cache, puts those answers back into the response. Anything that is
-    /// not a successful answer is passed on as it is, and never cached.
-    pub(super) fn absorb(&self, outcome: Outcome, now: Instant) -> Outcome {
+    /// keeps its answers for later if `keep` and, when some questions were
+    /// served from the cache, puts those answers back into the response.
+    /// Anything that is not a successful answer is passed on as it is, and
+    /// never cached.
+    pub(super) fn absorb(&self, outcome: Outcome, keep: bool, now: Instant) -> Outcome {
         let Outcome::Answered {
             body,
             request_id,
@@ -163,7 +174,7 @@ impl<'a> Reuse<'a> {
         else {
             return outcome;
         };
-        let merged = match self.remember(&body, now) {
+        let merged = match self.remember(&body, keep, now) {
             Ok(merged) => merged,
             // Nothing cached to put back: the body goes on as the backend
             // sent it, readable or not.
@@ -183,9 +194,10 @@ impl<'a> Reuse<'a> {
         }
     }
 
-    /// Stores the answers the backend gave, and returns the response with
-    /// the cached answers merged in. `None` when no question was cached.
-    fn remember(&self, body: &Bytes, now: Instant) -> Result<Option<Bytes>, String> {
+    /// Stores the answers the backend gave (if `keep`), and returns the
+    /// response with the cached answers merged in. `None` when no question
+    /// was cached.
+    fn remember(&self, body: &Bytes, keep: bool, now: Instant) -> Result<Option<Bytes>, String> {
         let upstream = UpstreamAnswers::parse(body)?;
         let envelope = Arc::new(Envelope::of(&upstream));
         let fresh: Vec<(QuestionKey, Box<RawValue>)> = self
@@ -202,7 +214,9 @@ impl<'a> Reuse<'a> {
                     .then(|| (slot.key, answer.clone()))
             })
             .collect();
-        self.cache.store(self.batch, fresh, &envelope, now);
+        if keep {
+            self.cache.store(self.batch, fresh, &envelope, now);
+        }
         if self.hits() == 0 {
             return Ok(None);
         }
@@ -301,7 +315,7 @@ mod tests {
             "answers": {"urgent": {"type": "noul", "noul": 0.9}, "angry": {"type": "noul", "noul": 0.1}},
             "usage": {"input_tokens": 40, "output_tokens": 20},
         });
-        let passed = body_of(reuse.absorb(answered(upstream.clone()), now));
+        let passed = body_of(reuse.absorb(answered(upstream.clone()), true, now));
         assert_eq!(passed, upstream);
 
         // Second call: one question is known, one is new.
@@ -318,7 +332,7 @@ mod tests {
             "answers": {"billing": {"type": "noul", "noul": 0.4}},
             "usage": {"input_tokens": 12, "output_tokens": 10},
         });
-        let merged = reuse.absorb(answered(upstream), later);
+        let merged = reuse.absorb(answered(upstream), true, later);
         let Outcome::Answered { input_tokens, .. } = &merged else {
             panic!("not an answer");
         };
@@ -358,7 +372,7 @@ mod tests {
             "answers": {"urgent": {"type": "noul", "noul": 0.9}},
             "usage": {"input_tokens": 40, "output_tokens": 10},
         });
-        reuse.absorb(answered(upstream), now);
+        reuse.absorb(answered(upstream), true, now);
 
         let mut again = request(&["urgent"]);
         let reuse = Reuse::lookup(&cache, &metrics, "typesafe", &mut again, false, now);
@@ -384,7 +398,7 @@ mod tests {
         let mut first = request(&["urgent"]);
         let reuse = Reuse::lookup(&cache, &metrics, "typesafe", &mut first, false, now);
         let upstream = json!({"model": "m", "answers": {"urgent": {"type": "noul", "noul": 0.9}}});
-        reuse.absorb(answered(upstream.clone()), now);
+        reuse.absorb(answered(upstream.clone()), true, now);
 
         let mut fresh = request(&["urgent"]);
         let reuse = Reuse::lookup(&cache, &metrics, "typesafe", &mut fresh, true, now);
@@ -417,7 +431,7 @@ mod tests {
             request_id: None,
         };
         assert!(matches!(
-            reuse.absorb(failed, now),
+            reuse.absorb(failed, true, now),
             Outcome::Rejected { .. }
         ));
         // A body that cannot be read is passed on as it is, and kept nowhere.
@@ -428,13 +442,53 @@ mod tests {
             batch_callers: 1,
         };
         assert!(matches!(
-            reuse.absorb(garbage, now),
+            reuse.absorb(garbage, true, now),
             Outcome::Answered { .. }
         ));
 
         let mut again = request(&["urgent"]);
         let reuse = Reuse::lookup(&cache, &metrics, "typesafe", &mut again, false, now);
         assert_eq!(reuse.label(), "miss");
+    }
+
+    #[test]
+    fn trim_takes_the_cached_questions_out_of_a_request_read_again() {
+        let cache = cache();
+        let metrics = Metrics::new();
+        let now = Instant::now();
+        let mut first = request(&["urgent"]);
+        let reuse = Reuse::lookup(&cache, &metrics, "typesafe", &mut first, false, now);
+        reuse.absorb(
+            answered(json!({"model": "m", "answers": {"urgent": {"type": "noul", "noul": 0.9}}})),
+            true,
+            now,
+        );
+
+        let mut second = request(&["urgent", "angry"]);
+        let reuse = Reuse::lookup(&cache, &metrics, "typesafe", &mut second, false, now);
+        let mut again = request(&["urgent", "angry"]);
+        reuse.trim(&mut again);
+        let ids: Vec<&str> = again.questions.iter().map(|q| q.id.as_str()).collect();
+        assert_eq!(ids, ["angry"]);
+    }
+
+    #[test]
+    fn an_answer_absorbed_without_keep_is_not_cached() {
+        let cache = cache();
+        let metrics = Metrics::new();
+        let now = Instant::now();
+        let mut first = request(&["urgent"]);
+        let reuse = Reuse::lookup(&cache, &metrics, "typesafe", &mut first, false, now);
+        reuse.absorb(
+            answered(json!({"model": "m", "answers": {"urgent": {"type": "noul", "noul": 0.9}}})),
+            false,
+            now,
+        );
+
+        let mut second = request(&["urgent"]);
+        let reuse = Reuse::lookup(&cache, &metrics, "typesafe", &mut second, false, now);
+        assert!(!reuse.is_complete());
+        assert_eq!(second.questions.len(), 1);
     }
 
     #[test]
@@ -446,12 +500,13 @@ mod tests {
         let reuse = Reuse::lookup(&cache, &metrics, "typesafe", &mut first, false, now);
         reuse.absorb(
             answered(json!({"model": "m", "answers": {"urgent": {"type": "noul", "noul": 0.9}}})),
+            true,
             now,
         );
 
         let mut second = request(&["urgent", "angry"]);
         let reuse = Reuse::lookup(&cache, &metrics, "typesafe", &mut second, false, now);
-        let outcome = reuse.absorb(answered(json!({"model": "m", "answers": {}})), now);
+        let outcome = reuse.absorb(answered(json!({"model": "m", "answers": {}})), true, now);
         assert!(matches!(outcome, Outcome::Failed(_)), "{outcome:?}");
     }
 }

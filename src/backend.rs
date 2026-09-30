@@ -10,6 +10,8 @@
 //!
 //! - `engine`: the protocol a backend speaks, System One or chat.
 //! - `upstream`: the HTTP client, with authentication, pacing and retries.
+//! - `breaker`: the circuit breaker that turns calls away from a backend
+//!   that keeps failing, so they can go to its fallbacks.
 //! - `chat`: the chat protocol, which answers questions from token
 //!   probabilities.
 
@@ -27,10 +29,12 @@ use crate::metrics::Metrics;
 use crate::scheduling::{BatchLimits, Coalescer, Dispatcher, Gcra, Outcome};
 use crate::wire::{Invalid, PreparedRequest};
 
+mod breaker;
 mod chat;
 mod engine;
 mod upstream;
 
+pub use breaker::{CircuitBreaker, Verdict};
 use chat::ChatEngine;
 pub use engine::Engine;
 pub use upstream::{
@@ -46,6 +50,10 @@ pub struct Backend {
     max_queue_wait: Duration,
     /// Whether the answer cache may serve and keep this backend's answers.
     pub cached: bool,
+    /// Turns calls away while the backend keeps failing.
+    pub breaker: Arc<CircuitBreaker>,
+    /// The backends to try, in this order, when this one is unavailable.
+    fallback: Vec<String>,
 }
 
 /// What `GET /v1/models` shows for a backend.
@@ -139,14 +147,26 @@ impl Backend {
         };
         // One second of tokens may go at once.
         let tokens_per_second = u64::from(config.tokens_per_second);
-        let dispatcher = Arc::new(Dispatcher::new(
+        let breaker = Arc::new(CircuitBreaker::new(
             name,
-            engine,
-            pacer,
-            Gcra::per_second(tokens_per_second as f64, tokens_per_second),
-            config.max_concurrency,
-            Arc::clone(metrics),
+            config.circuit_breaker_failures,
+            millis(config.circuit_breaker_cooldown_ms),
+            metrics
+                .circuit_state
+                .get_or_create(&Metrics::backend(name))
+                .clone(),
         ));
+        let dispatcher = Arc::new(
+            Dispatcher::new(
+                name,
+                engine,
+                pacer,
+                Gcra::per_second(tokens_per_second as f64, tokens_per_second),
+                config.max_concurrency,
+                Arc::clone(metrics),
+            )
+            .with_breaker(Arc::clone(&breaker)),
+        );
         let coalescer = Arc::new(Coalescer::new(
             BatchLimits {
                 window: millis(coalescing.window_ms),
@@ -165,6 +185,8 @@ impl Backend {
             models,
             max_queue_wait: millis(config.max_queue_wait_ms),
             cached: config.cache,
+            breaker,
+            fallback: config.fallback.clone(),
         })
     }
 
@@ -230,12 +252,21 @@ impl Backends {
         env: &dyn Fn(&str) -> Option<String>,
         metrics: &Arc<Metrics>,
     ) -> anyhow::Result<Self> {
-        config
+        let backends: Vec<Backend> = config
             .backends
             .iter()
             .map(|backend| Backend::build(backend, &config.coalescing, env, metrics))
-            .collect::<anyhow::Result<_>>()
-            .map(Self)
+            .collect::<anyhow::Result<_>>()?;
+        for backend in &backends {
+            for other in &backend.fallback {
+                anyhow::ensure!(
+                    backends.iter().any(|known| known.name == *other),
+                    "backend {:?}: fallback names {other:?}, which is not a configured backend",
+                    backend.name
+                );
+            }
+        }
+        Ok(Self(backends))
     }
 
     /// The backend that serves `model`: the one with the most specific
@@ -250,6 +281,29 @@ impl Backends {
             }
         }
         best.map(|(backend, _)| backend)
+    }
+
+    /// The backends that may serve a call routed to `primary`, in the order to
+    /// try them: `primary`, then each of its fallbacks in turn, every one
+    /// followed by its own fallbacks, each backend once. Configuration
+    /// validation rules out cycles, and the `once` keeps a diamond (two
+    /// backends falling back to the same third) from trying it twice.
+    pub fn chain<'a>(&'a self, primary: &'a Backend) -> Vec<&'a Backend> {
+        let mut chain = Vec::new();
+        self.extend_chain(primary, &mut chain);
+        chain
+    }
+
+    fn extend_chain<'a>(&'a self, backend: &'a Backend, chain: &mut Vec<&'a Backend>) {
+        if chain.iter().any(|seen| std::ptr::eq(*seen, backend)) {
+            return;
+        }
+        chain.push(backend);
+        for name in &backend.fallback {
+            if let Some(next) = self.0.iter().find(|known| known.name == *name) {
+                self.extend_chain(next, chain);
+            }
+        }
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &Backend> {
@@ -343,5 +397,38 @@ mod tests {
             r#"{"name":"jev-latest","release_date":"2026-09-15"}"#
         );
         assert!(model_entries(b"{}").is_err());
+    }
+
+    #[tokio::test]
+    async fn the_chain_follows_fallbacks_depth_first_and_visits_each_backend_once() {
+        let backends = backends(
+            r#"
+            [[backend]]
+            name = "a"
+            models = ["a-*"]
+            fallback = ["b", "c"]
+            [[backend]]
+            name = "b"
+            models = ["b-*"]
+            fallback = ["d", "c"]
+            [[backend]]
+            name = "c"
+            models = ["c-*"]
+            [[backend]]
+            name = "d"
+            models = ["d-*"]
+            "#,
+        );
+        let names = |model| {
+            let primary = backends.route(model).unwrap();
+            backends
+                .chain(primary)
+                .iter()
+                .map(|backend| backend.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names("a-1"), ["a", "b", "d", "c"]);
+        assert_eq!(names("b-1"), ["b", "d", "c"]);
+        assert_eq!(names("c-1"), ["c"]);
     }
 }

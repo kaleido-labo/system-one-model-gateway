@@ -19,5 +19,5 @@ mod dispatch;
 mod limiter;
 
 pub use coalescer::{BatchLimits, Coalescer, Saturated};
-pub use dispatch::{Dispatcher, Outcome};
+pub use dispatch::{Dispatcher, MIN_RETRY_AFTER, Outcome};
 pub use limiter::Gcra;

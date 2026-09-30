@@ -106,6 +106,9 @@ and timings.
 | warn | `retrying the upstream call` | A retry, with `backend`, `attempt`, `delay_ms` and `failure`. |
 | warn | `upstream call failed` | A call failed after its retries. |
 | warn | `the backend rejected a merged call; replaying each call on its own` | A 400 or 422 on a merged call. |
+| warn | `circuit breaker opened: the backend failed every call lately` | A backend failed `circuit_breaker_failures` calls in a row. Its calls go to its fallbacks, or get a 503, for `cooldown_ms`. |
+| warn | `circuit breaker opened again: the trial call failed` | The trial call after a cool-down failed. |
+| info | `circuit breaker closed: the trial call was answered` | The backend answered the trial call. |
 | error | `the backend refused the gateway's API key` | A backend answered 401. Fix the key: every call to that backend fails with a 502 until you do. |
 | error | `the answer could not be split` | A backend's response was unreadable or had no answer for a question. |
 | debug | `upstream call answered` | One per upstream call, with the callers and questions it carried. |
@@ -133,6 +136,13 @@ Every name starts with `systemone_gateway_`.
 | `upstream_calls_total` | counter | `backend`, `status` | HTTP calls to a backend, by final status after retries. `status="0"` means the backend could not be reached. A chat backend makes one call per question. |
 | `upstream_duration_seconds` | histogram | `backend` | Time spent in a backend's HTTP calls, retries included. |
 | `upstream_retries_total` | counter | `backend` | Attempts retried after a 429, 500, 502, 503, 504, 529 or network error. |
+
+### Circuit breaker and fallback
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `circuit_state` | gauge | `backend` | The backend's circuit breaker: `0` closed, `1` half-open (one trial call allowed), `2` open (calls turned away). Every backend is exported from the start, at `0` when the breaker is off. An open breaker turns half-open when the first call arrives after the cool-down, so the gauge stays at `2` until then. |
+| `fallback_calls_total` | counter | `from`, `to` | Calls served by a fallback backend (`to`) instead of the backend their model routes to (`from`). Counted when the gateway picks the fallback, whether its answer is a success or not. |
 
 ### Merging
 
@@ -183,6 +193,12 @@ sum by (backend) (rate(systemone_gateway_batch_callers_sum[5m]))
 
 # 95th percentile of the time a batch waits before going upstream, per backend
 histogram_quantile(0.95, sum by (backend, le) (rate(systemone_gateway_queue_wait_seconds_bucket[5m])))
+
+# Backends with an open breaker
+max by (backend) (systemone_gateway_circuit_state) == 2
+
+# Calls answered by a fallback, per pair of backends
+sum by (from, to) (rate(systemone_gateway_fallback_calls_total[5m]))
 
 # Input tokens per service
 sum by (service, backend) (rate(systemone_gateway_input_tokens_total[1h]))
@@ -239,6 +255,15 @@ merging cannot help with because the calls are not in flight together.
 - Each replica has its own cache, so the hit ratio falls as replicas are added,
   like merging.
 
+**Circuit breaker.** The defaults (5 failures in a row, a 30 s cool-down) suit a
+backend that is either up or down. The cool-down is how long a service waits
+before the first trial call after an outage starts, and how long a dead backend
+is left alone. Shorten it if the backend usually recovers within seconds, and
+lengthen it if every trial call costs the callers an attempt timeout. Raise
+`circuit_breaker_failures` for a backend with low traffic, where a few failures
+in a row say little. Alert on `circuit_state == 2`: a service only notices the
+outage through 503s, or not at all when a fallback answers.
+
 **Per-service quotas.** Set `requests_per_minute` and `max_concurrent` on each
 service so that one noisy service cannot use up the shared budget. The sum of
 the services' rates can exceed the backend's limit: they are caps, not
@@ -285,6 +310,11 @@ SDK timeout (10 s by default, in the caller)
   gateway counts `bytes_per_token` bytes per token. The estimate sizes merged
   calls, books the tokens-per-second budget (corrected with the real `usage`
   after each call) and weights the usage split, where only ratios matter.
+- **Breakers are per process.** Each replica learns about an outage from its own
+  failed calls, and recovers on its own trial call.
+- **Fallback answers differ.** A chat backend standing in for a System One
+  backend is not calibrated like Jev. See
+  [Backends](backends.md#chat-backends-are-not-calibrated-like-jev).
 - **Provider limits move.** TypeSafe's limits change without notice
   ([models](https://docs.typesafe.ai/models.md)), and the gateway does not learn
   them.

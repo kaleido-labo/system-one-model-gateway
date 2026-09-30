@@ -226,6 +226,22 @@ impl Config {
             }
         }
 
+        for backend in &self.backends {
+            for other in &backend.fallback {
+                ensure!(
+                    backend_names.contains(other.as_str()),
+                    "backend {:?}: fallback names {other:?}, which is not a configured backend",
+                    backend.name
+                );
+            }
+        }
+        if let Some(cycle) = self.fallback_cycle() {
+            bail!(
+                "fallback goes round in a circle ({}): a call would never settle on a backend",
+                cycle.join(" -> ")
+            );
+        }
+
         let coalescing = &self.coalescing;
         ensure!(
             coalescing.max_questions > 0,
@@ -299,6 +315,48 @@ impl Config {
             }
         }
         Ok(())
+    }
+}
+
+impl Config {
+    /// A chain of fallbacks that leads back to where it started, as the
+    /// backend names along it, if there is one.
+    fn fallback_cycle(&self) -> Option<Vec<&str>> {
+        let next: HashMap<&str, &[String]> = self
+            .backends
+            .iter()
+            .map(|backend| (backend.name.as_str(), backend.fallback.as_slice()))
+            .collect();
+        // Depth-first walk. `path` is the chain being followed, `done` the
+        // backends whose whole chain is known to lead nowhere twice.
+        fn walk<'a>(
+            name: &'a str,
+            next: &HashMap<&'a str, &'a [String]>,
+            path: &mut Vec<&'a str>,
+            done: &mut HashSet<&'a str>,
+        ) -> Option<Vec<&'a str>> {
+            if let Some(start) = path.iter().position(|seen| *seen == name) {
+                let mut cycle = path[start..].to_vec();
+                cycle.push(name);
+                return Some(cycle);
+            }
+            if done.contains(name) {
+                return None;
+            }
+            path.push(name);
+            for other in next.get(name).copied().unwrap_or_default() {
+                if let Some(cycle) = walk(other, next, path, done) {
+                    return Some(cycle);
+                }
+            }
+            path.pop();
+            done.insert(name);
+            None
+        }
+        let mut done = HashSet::new();
+        self.backends
+            .iter()
+            .find_map(|backend| walk(&backend.name, &next, &mut Vec::new(), &mut done))
     }
 }
 
@@ -531,5 +589,63 @@ mod tests {
         assert!(
             error_of("[[backend]]\nname = \"t\"\nprotocol = \"grpc\"").contains("unknown variant")
         );
+    }
+
+    #[test]
+    fn the_breaker_and_fallback_settings_have_defaults() {
+        let config = Config::from_toml(&with_service("")).unwrap();
+        let backend = &config.backends[0];
+        assert_eq!(backend.circuit_breaker_failures, 5);
+        assert_eq!(backend.circuit_breaker_cooldown_ms, 30_000);
+        assert!(backend.fallback.is_empty());
+    }
+
+    #[test]
+    fn fallbacks_must_name_other_backends_without_going_in_circles() {
+        let backend = |name: &str, models: &str, fallback: &str| {
+            format!(
+                "[[backend]]\nname = \"{name}\"\nmodels = [\"{models}\"]\nfallback = [{fallback}]\n"
+            )
+        };
+        let ok = format!(
+            "{}{}{}",
+            backend("a", "a-*", "\"b\", \"c\""),
+            backend("b", "b-*", "\"c\""),
+            backend("c", "c-*", "")
+        );
+        // A diamond is not a cycle.
+        assert!(Config::from_toml(&format!("{ok}\n{}", with_service(""))).is_ok());
+
+        assert!(error_of(&backend("a", "*", "\"a\"")).contains("must not list the backend itself"));
+        assert!(error_of(&backend("a", "*", "\"nobody\"")).contains("not a configured backend"));
+        assert!(
+            error_of(&format!(
+                "{}{}",
+                backend("a", "a-*", "\"b\", \"b\""),
+                backend("b", "b-*", "")
+            ))
+            .contains("twice")
+        );
+        let cycle = error_of(&format!(
+            "{}{}{}",
+            backend("a", "a-*", "\"b\""),
+            backend("b", "b-*", "\"c\""),
+            backend("c", "c-*", "\"a\"")
+        ));
+        assert!(cycle.contains("a -> b -> c -> a"), "{cycle}");
+    }
+
+    #[test]
+    fn the_breaker_needs_a_cool_down_unless_it_is_off() {
+        assert!(
+            error_of("[[backend]]\nname = \"t\"\ncircuit_breaker_cooldown_ms = 0")
+                .contains("circuit_breaker_cooldown_ms")
+        );
+        let off = format!(
+            "[[backend]]\nname = \"t\"\ncircuit_breaker_failures = 0\n\
+             circuit_breaker_cooldown_ms = 0\n{}",
+            with_service("")
+        );
+        assert!(Config::from_toml(&off).is_ok());
     }
 }
