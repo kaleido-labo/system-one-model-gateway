@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM rust:1.96-bookworm AS build
+FROM rust:1.98-bookworm AS build
 WORKDIR /src
 
 # Dependencies first, in their own layer: a code change then rebuilds only
