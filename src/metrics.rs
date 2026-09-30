@@ -310,7 +310,23 @@ mod tests {
             .isolated_replays
             .get_or_create(&Metrics::backend("hf"))
             .inc();
+        metrics
+            .requests_per_minute_limit
+            .get_or_create(&Metrics::backend("hf"))
+            .set(840.0);
+        metrics
+            .rate_decreases
+            .get_or_create(&Metrics::backend("hf"))
+            .inc();
         let text = metrics.render();
+        assert!(
+            text.contains(r#"systemone_gateway_requests_per_minute_limit{backend="hf"} 840.0"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"systemone_gateway_rate_decreases_total{backend="hf"} 1"#),
+            "{text}"
+        );
         assert!(
             text.contains(r#"systemone_gateway_calls_total{service="ocr",status="200"} 1"#),
             "{text}"
