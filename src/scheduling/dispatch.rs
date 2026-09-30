@@ -12,10 +12,10 @@ use tokio::time::{Instant, sleep_until, timeout_at};
 use tracing::{debug, error, warn};
 
 use crate::backend::Engine;
-use crate::batch::{Plan, SplitError};
 use crate::error::GatewayError;
-use crate::limiter::Gcra;
 use crate::metrics::Metrics;
+use crate::scheduling::batch::{Plan, SplitError};
+use crate::scheduling::limiter::Gcra;
 use crate::upstream::{UpstreamFailure, describe};
 use crate::wire::{PreparedRequest, input_tokens};
 

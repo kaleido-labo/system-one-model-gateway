@@ -18,8 +18,8 @@ use tokio::time::{Instant, sleep_until};
 use tracing::warn;
 
 use crate::error::RETRY_AFTER_MS;
-use crate::limiter::Gcra;
 use crate::metrics::{Metrics, UpstreamLabels};
+use crate::scheduling::Gcra;
 
 /// Response header carrying the vendor's id for a request. The gateway
 /// hands the id back under this name whatever the backend, so SDK users

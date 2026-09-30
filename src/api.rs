@@ -23,10 +23,9 @@ use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::{Level, Span};
 
 use crate::backend::Backends;
-use crate::coalescer::Saturated;
-use crate::dispatch::Outcome;
 use crate::error::{GatewayError, insert_retry_after};
 use crate::metrics::{CallLabels, Metrics};
+use crate::scheduling::{Outcome, Saturated};
 use crate::services::{Refusal, ServiceId, ServiceRegistry};
 use crate::upstream::REQUEST_ID;
 use crate::wire::{Invalid, PreparedRequest, RequestError, TokenEstimator};

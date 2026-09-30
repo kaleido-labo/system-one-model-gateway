@@ -11,8 +11,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 use crate::config::ServiceConfig;
-use crate::limiter::Gcra;
 use crate::pattern::{ModelPattern, best_match, parse_all};
+use crate::scheduling::Gcra;
 
 pub type ServiceId = usize;
 

@@ -18,8 +18,8 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::time::{Instant, sleep_until};
 
-use crate::dispatch::{Dispatcher, MIN_RETRY_AFTER, Member, Outcome};
 use crate::error::GatewayError;
+use crate::scheduling::dispatch::{Dispatcher, MIN_RETRY_AFTER, Member, Outcome};
 use crate::wire::{BatchKey, PreparedRequest, QuestionKey};
 
 /// What one merged upstream call may carry.
@@ -288,8 +288,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use crate::backend::Engine;
-    use crate::limiter::Gcra;
     use crate::metrics::Metrics;
+    use crate::scheduling::limiter::Gcra;
     use crate::upstream::{ApiKey, RetryPolicy, Upstream};
     use crate::wire::TokenEstimator;
     use serde_json::json;

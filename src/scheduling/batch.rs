@@ -10,8 +10,11 @@ use bytes::Bytes;
 use indexmap::IndexMap;
 use serde_json::value::RawValue;
 
-use crate::usage::apportion;
 use crate::wire::{ObjectWriter, PreparedRequest, QuestionKey, UpstreamAnswers, input_tokens};
+
+mod usage;
+
+use usage::apportion;
 
 /// How a batch of calls goes upstream, and how the answer comes back.
 #[derive(Debug)]

@@ -11,18 +11,14 @@
 mod api;
 mod app;
 mod backend;
-mod batch;
 mod chat;
-mod coalescer;
 mod config;
-mod dispatch;
 mod error;
-mod limiter;
 mod metrics;
 mod pattern;
+mod scheduling;
 mod services;
 mod upstream;
-mod usage;
 mod wire;
 
 pub use app::Gateway;
