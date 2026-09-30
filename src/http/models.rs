@@ -15,7 +15,7 @@ use crate::telemetry;
 /// `models_cache_ttl_ms`; a chat backend lists the exact names it serves.
 pub(super) async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let call = telemetry::models_call(request_id(&headers));
-    let response = list_models(&state.0, &headers, &call)
+    let response = list_models(&state.snapshot(), &headers, &call)
         .instrument(call.clone())
         .await;
     telemetry::finish_call(&call, response.status());

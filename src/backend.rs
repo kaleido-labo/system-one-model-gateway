@@ -249,7 +249,7 @@ fn model_entries(body: &[u8]) -> Result<Vec<Box<RawValue>>, String> {
     serde_json::from_str(models.get()).map_err(|err| format!("model list: {err}"))
 }
 
-pub struct Backends(Vec<Backend>);
+pub struct Backends(Vec<Arc<Backend>>);
 
 impl Backends {
     /// Builds every configured backend. `env` looks up an environment
@@ -260,10 +260,28 @@ impl Backends {
         limiters: &Limiters,
         metrics: &Arc<Metrics>,
     ) -> anyhow::Result<Self> {
-        let backends: Vec<Backend> = config
+        Self::build_reusing(config, env, limiters, metrics, |_| None)
+    }
+
+    /// Like `build`, but asks `reuse` for each backend first: a backend it
+    /// returns is kept as it is, with its queue, pacing, circuit breaker and
+    /// models list, instead of being built again. Whether a backend may be
+    /// kept is the caller's decision, because it depends on what else changed.
+    pub fn build_reusing(
+        config: &Config,
+        env: &dyn Fn(&str) -> Option<String>,
+        limiters: &Limiters,
+        metrics: &Arc<Metrics>,
+        reuse: impl Fn(&BackendConfig) -> Option<Arc<Backend>>,
+    ) -> anyhow::Result<Self> {
+        let backends: Vec<Arc<Backend>> = config
             .backends
             .iter()
-            .map(|backend| Backend::build(backend, &config.coalescing, env, limiters, metrics))
+            .map(|backend| match reuse(backend) {
+                Some(kept) => Ok(kept),
+                None => Backend::build(backend, &config.coalescing, env, limiters, metrics)
+                    .map(Arc::new),
+            })
             .collect::<anyhow::Result<_>>()?;
         for backend in &backends {
             for other in &backend.fallback {
@@ -281,7 +299,7 @@ impl Backends {
     /// match, an exact name before the longest prefix.
     pub fn route(&self, model: &str) -> Option<&Backend> {
         let mut best: Option<(&Backend, _)> = None;
-        for backend in &self.0 {
+        for backend in self.iter() {
             if let Some(specificity) = best_match(&backend.patterns, model)
                 && best.is_none_or(|(_, current)| specificity > current)
             {
@@ -308,14 +326,19 @@ impl Backends {
         }
         chain.push(backend);
         for name in &backend.fallback {
-            if let Some(next) = self.0.iter().find(|known| known.name == *name) {
+            if let Some(next) = self.named(name) {
                 self.extend_chain(next, chain);
             }
         }
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &Backend> {
-        self.0.iter()
+        self.0.iter().map(|backend| &**backend)
+    }
+
+    /// The backend called `name`, to be handed to the next `Backends`.
+    pub fn named(&self, name: &str) -> Option<&Arc<Backend>> {
+        self.0.iter().find(|backend| backend.name == name)
     }
 }
 

@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use anyhow::{Context, bail, ensure};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 mod backend;
 mod cluster;
@@ -50,7 +51,7 @@ pub struct Config {
     pub cluster: Option<ClusterConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ServerConfig {
     /// Where services send their System One calls.
@@ -68,6 +69,11 @@ pub struct ServerConfig {
     pub request_timeout_ms: u64,
     pub max_body_bytes: usize,
     pub log_format: LogFormat,
+    /// How often the gateway looks at the configuration file and reloads it
+    /// when its content changed. Zero, the default, leaves it to `SIGHUP`.
+    /// The content is compared, not the modification time, because a
+    /// Kubernetes ConfigMap update swaps a symlink and keeps old times.
+    pub config_reload_interval_ms: u64,
 }
 
 impl Default for ServerConfig {
@@ -79,6 +85,7 @@ impl Default for ServerConfig {
             request_timeout_ms: 9_000,
             max_body_bytes: 2 * 1024 * 1024,
             log_format: LogFormat::Text,
+            config_reload_interval_ms: 0,
         }
     }
 }
@@ -90,7 +97,7 @@ pub enum LogFormat {
     Json,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct CoalescingConfig {
     /// How long a new batch stays open for other callers with the same state.
@@ -122,7 +129,7 @@ impl Default for CoalescingConfig {
 /// and the time to live are things an operator reasons about for the whole
 /// process, and a backend that must not be cached opts out with `cache = false`
 /// in its own block.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct CacheConfig {
     /// Off by default: a cached answer is a choice to trade freshness for
@@ -144,7 +151,7 @@ impl Default for CacheConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceConfig {
     /// Shows up in metrics and logs.
@@ -178,12 +185,29 @@ fn valid_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
+/// SHA-256 of a configuration file's content, to tell whether it changed.
+pub type ContentHash = [u8; 32];
+
+pub fn content_hash(text: &str) -> ContentHash {
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&Sha256::digest(text.as_bytes()));
+    digest
+}
+
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
+        Self::load_hashed(path).map(|(config, _)| config)
+    }
+
+    /// Like `load`, with the hash of the content that was parsed, so that a
+    /// watcher started afterwards compares against what is running and not
+    /// against whatever the file holds by then.
+    pub fn load_hashed(path: &Path) -> anyhow::Result<(Self, ContentHash)> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("could not read {}", path.display()))?;
-        Self::from_toml(&text)
-            .with_context(|| format!("invalid configuration in {}", path.display()))
+        let config = Self::from_toml(&text)
+            .with_context(|| format!("invalid configuration in {}", path.display()))?;
+        Ok((config, content_hash(&text)))
     }
 
     pub fn from_toml(text: &str) -> anyhow::Result<Self> {
@@ -204,6 +228,10 @@ impl Config {
         ensure!(
             server.max_body_bytes > 0,
             "server.max_body_bytes must be positive"
+        );
+        ensure!(
+            server.config_reload_interval_ms == 0 || server.config_reload_interval_ms >= 100,
+            "server.config_reload_interval_ms must be 0 (off) or at least 100"
         );
         if let Some(variable) = &server.admin_token_env {
             ensure!(

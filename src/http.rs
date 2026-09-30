@@ -7,8 +7,8 @@
 //! to build a response. The two public endpoints live in `systemone` and
 //! `models`.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use axum::Router;
@@ -45,25 +45,70 @@ pub const CACHE: HeaderName = HeaderName::from_static("x-systemone-gateway-cache
 /// The backend that answered.
 pub const BACKEND: HeaderName = HeaderName::from_static("x-systemone-gateway-backend");
 
+/// What the handlers share. Cloning it shares it.
 #[derive(Clone)]
-pub struct AppState(Arc<Shared>);
+pub struct AppState(Arc<Inner>);
 
+struct Inner {
+    /// The configuration in force. A handler clones the `Arc` once, at the
+    /// start of a call (`AppState::snapshot`), and uses that for the whole
+    /// call, so a reload can land at any moment without a call ever seeing
+    /// half of the old configuration and half of the new one.
+    ///
+    /// A lock that is only held to clone or replace an `Arc` costs about what
+    /// an atomic does, never waits on anything slow and needs no dependency,
+    /// which is why this is not an `ArcSwap`.
+    current: RwLock<Arc<Shared>>,
+    /// Set when `server.admin_token_env` is: `/metrics` then needs it. It is
+    /// read at start and never reloaded.
+    admin_token: Option<AdminToken>,
+    ready: AtomicBool,
+}
+
+/// The part of the state that a configuration reload replaces: everything a
+/// call reads from the configuration, as of one moment.
 pub struct Shared {
     pub registry: ServiceRegistry,
     pub backends: Backends,
+    /// The same for every generation: counters keep counting across reloads.
     pub metrics: Arc<Metrics>,
     pub estimator: TokenEstimator,
-    /// `None` unless `[cache]` is enabled.
-    pub cache: Option<AnswerCache>,
+    /// `None` unless `[cache]` is enabled. Shared with the next generation
+    /// when `[cache]` did not change, so a reload does not empty it.
+    pub cache: Option<Arc<AnswerCache>>,
     pub request_timeout: Duration,
-    /// Set when `server.admin_token_env` is: `/metrics` then needs it.
-    pub admin_token: Option<AdminToken>,
-    pub ready: AtomicBool,
 }
 
 impl AppState {
-    pub fn new(shared: Shared) -> Self {
-        Self(Arc::new(shared))
+    pub fn new(shared: Shared, admin_token: Option<AdminToken>) -> Self {
+        Self(Arc::new(Inner {
+            current: RwLock::new(Arc::new(shared)),
+            admin_token,
+            ready: AtomicBool::new(false),
+        }))
+    }
+
+    /// The configuration as it is now. Take it once per call.
+    pub fn snapshot(&self) -> Arc<Shared> {
+        // The lock guards a pointer that is replaced in one statement, so a
+        // panic elsewhere cannot leave it half written.
+        Arc::clone(
+            &self
+                .0
+                .current
+                .read()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
+    }
+
+    /// Makes `shared` the configuration of every call that starts from now
+    /// on. Calls already running keep the one they started with.
+    pub fn replace(&self, shared: Shared) {
+        *self
+            .0
+            .current
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Arc::new(shared);
     }
 
     pub fn set_ready(&self, ready: bool) {
@@ -190,7 +235,7 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Response 
             CONTENT_TYPE,
             HeaderValue::from_static("application/openmetrics-text; version=1.0.0; charset=utf-8"),
         )],
-        state.0.metrics.render(),
+        state.snapshot().metrics.render(),
     )
         .into_response()
 }

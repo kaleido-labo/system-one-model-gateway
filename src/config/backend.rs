@@ -22,7 +22,7 @@ pub enum Protocol {
 }
 
 /// One model provider behind the gateway, with its own key and limits.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct BackendConfig {
     /// Shows up in metrics, logs and the `x-systemone-gateway-backend` header.

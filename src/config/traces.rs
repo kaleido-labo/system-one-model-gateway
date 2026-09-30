@@ -12,7 +12,7 @@ const TRACES_ENDPOINT_ENV: &str = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
 /// Where OTLP over HTTP takes traces.
 const TRACES_PATH: &str = "/v1/traces";
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct TracingConfig {
     /// Base URL of an OTLP/HTTP collector, such as `http://localhost:4318`.

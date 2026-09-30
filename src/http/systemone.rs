@@ -42,20 +42,22 @@ pub(super) async fn systemone(
     body: Bytes,
 ) -> Response {
     let arrived = Instant::now();
+    // One snapshot for the whole call: a reload while it is queued changes
+    // nothing for it.
+    let state = state.snapshot();
     let log_span = Span::current();
     let call = telemetry::systemone_call(request_id(&headers));
     let response = async {
-        let Some(service_id) = state.0.registry.authenticate(&headers) else {
-            record_call(&state.0.metrics, "-", StatusCode::UNAUTHORIZED, arrived);
+        let Some(service_id) = state.registry.authenticate(&headers) else {
+            record_call(&state.metrics, "-", StatusCode::UNAUTHORIZED, arrived);
             return GatewayError::unauthorized().into_response();
         };
         telemetry::adopt_caller(&call, &headers);
-        let service = state.0.registry.get(service_id);
+        let service = state.registry.get(service_id);
         log_span.record("service", service.name.as_str());
         call.record("gateway.service", service.name.as_str());
-        let response =
-            handle_systemone(&state.0, service_id, &headers, &body, arrived, &call).await;
-        record_call(&state.0.metrics, &service.name, response.status(), arrived);
+        let response = handle_systemone(&state, service_id, &headers, &body, arrived, &call).await;
+        record_call(&state.metrics, &service.name, response.status(), arrived);
         response
     }
     .instrument(call.clone())

@@ -45,6 +45,12 @@ pub struct TokenLabels {
     pub backend: String,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ResultLabels {
+    /// `ok` or `error`.
+    pub result: &'static str,
+}
+
 type HistogramFamily<L> = Family<L, Histogram, fn() -> Histogram>;
 
 pub struct Metrics {
@@ -68,6 +74,8 @@ pub struct Metrics {
     pub cache_hits: Family<BackendLabels, Counter>,
     pub cache_misses: Family<BackendLabels, Counter>,
     pub cache_entries: Gauge,
+    pub config_reloads: Family<ResultLabels, Counter>,
+    pub config_last_reload: Gauge,
 }
 
 fn latency_histogram() -> Histogram {
@@ -206,6 +214,23 @@ impl Metrics {
             "Answers held by the answer cache, expired ones included until they are dropped",
             cache_entries.clone(),
         );
+        let config_reloads = Family::<ResultLabels, Counter>::default();
+        registry.register(
+            "config_reloads",
+            "Attempts to reload the configuration, by result: ok, or error when the file was invalid and the gateway kept running on the previous one",
+            config_reloads.clone(),
+        );
+        // Both results exist from the start, so a rate() or an alert on the
+        // errors does not have to wait for the first one.
+        for result in ["ok", "error"] {
+            let _ = config_reloads.get_or_create(&ResultLabels { result });
+        }
+        let config_last_reload = Gauge::default();
+        registry.register(
+            "config_last_reload_timestamp_seconds",
+            "Unix time of the last configuration that was loaded successfully, at start or by a reload",
+            config_last_reload.clone(),
+        );
 
         Self {
             registry,
@@ -228,7 +253,31 @@ impl Metrics {
             cache_hits,
             cache_misses,
             cache_entries,
+            config_reloads,
+            config_last_reload,
         }
+    }
+
+    /// Counts a reload attempt. A successful one also stamps the time.
+    pub fn record_reload(&self, ok: bool) {
+        let result = if ok { "ok" } else { "error" };
+        self.config_reloads
+            .get_or_create(&ResultLabels { result })
+            .inc();
+        if ok {
+            self.stamp_config_loaded();
+        }
+    }
+
+    /// Sets `config_last_reload_timestamp_seconds` to now. Called at start
+    /// too: the gauge then says how old the running configuration is.
+    pub fn stamp_config_loaded(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| {
+                i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
+            });
+        self.config_last_reload.set(now);
     }
 
     pub fn service(name: &str) -> ServiceLabels {

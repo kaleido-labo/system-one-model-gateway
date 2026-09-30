@@ -5,7 +5,7 @@ use serde::Deserialize;
 
 /// Where replicas keep the rate limits they share. Without this table the
 /// gateway paces in memory, per process, and never contacts Redis.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClusterConfig {
     /// Environment variable holding the Redis URL. The URL can carry a

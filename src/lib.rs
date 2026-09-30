@@ -14,7 +14,8 @@
 //! routed by `backend`, merged and paced by `scheduling`, and answered from
 //! the backend's reply.
 //!
-//! - `app`: starts and stops the public and admin servers.
+//! - `app`: starts and stops the public and admin servers, and swaps in a new
+//!   configuration while they run (`reload`).
 //! - `config`: the TOML configuration, including model name patterns.
 //! - `http`: the public API, which copies TypeSafe's, and the admin endpoints.
 //! - `services`: who may call the gateway, and each service's own limits.
@@ -42,7 +43,7 @@ mod services;
 mod telemetry;
 mod wire;
 
-pub use app::Gateway;
+pub use app::{Gateway, Reloaded, Reloader};
 pub use config::{Config, LogFormat, Protocol, TracesEndpoint, TracingConfig};
 pub use services::{generate_key, hash_key};
 pub use telemetry::{Telemetry, logs_filter};

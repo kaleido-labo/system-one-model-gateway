@@ -1,8 +1,8 @@
-//! Wiring the configuration into running servers.
+//! Wiring the configuration into running servers, and swapping it for a new
+//! one while they run (`reload`).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use anyhow::Context;
 use tokio::net::TcpListener;
@@ -19,11 +19,16 @@ use crate::scheduling::Limiters;
 use crate::services::ServiceRegistry;
 use crate::wire::TokenEstimator;
 
+mod reload;
+
+pub use reload::{Reloaded, Reloader};
+
 /// Both servers, listening.
 pub struct Gateway {
     pub public_addr: SocketAddr,
     pub admin_addr: SocketAddr,
     state: AppState,
+    reloader: Reloader,
     stop: watch::Sender<()>,
     servers: JoinSet<std::io::Result<()>>,
 }
@@ -31,12 +36,15 @@ pub struct Gateway {
 impl Gateway {
     /// Binds both listeners and starts serving. Port 0 picks a free port;
     /// the chosen addresses are in `public_addr` and `admin_addr`. `env`
-    /// looks up an environment variable by name, for the backends' keys.
+    /// looks up an environment variable by name, for the backends' keys; it
+    /// is kept, to check the environment again when the configuration is
+    /// reloaded.
     pub async fn start(
         config: &Config,
-        env: impl Fn(&str) -> Option<String>,
+        env: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
     ) -> anyhow::Result<Self> {
-        let state = build_state(config, &env)?;
+        let (state, limiters) = build_state(config, &env)?;
+        let reloader = Reloader::new(state.clone(), Box::new(env), limiters, config);
         let public = TcpListener::bind(config.server.listen)
             .await
             .with_context(|| format!("could not listen on {}", config.server.listen))?;
@@ -78,9 +86,22 @@ impl Gateway {
             public_addr,
             admin_addr,
             state,
+            reloader,
             stop,
             servers,
         })
+    }
+
+    /// Applies `config` to the running gateway, as a reload does. See
+    /// `Reloader::reload`.
+    pub fn reload(&self, config: &Config) -> anyhow::Result<Reloaded> {
+        self.reloader.reload(config)
+    }
+
+    /// A handle that reloads the configuration, for a task that outlives the
+    /// borrow of the gateway: the `SIGHUP` handler, the file watcher.
+    pub fn reloader(&self) -> Reloader {
+        self.reloader.clone()
     }
 
     /// Stops taking connections, lets in-flight calls finish, and returns
@@ -97,37 +118,53 @@ impl Gateway {
     }
 }
 
-fn build_state(config: &Config, env: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<AppState> {
-    // Like a backend's key: a variable that is named but empty stops the
-    // start, so a typo cannot leave `/metrics` open without anyone noticing.
-    let admin_token = match &config.server.admin_token_env {
-        Some(variable) => {
-            let token = env(variable).unwrap_or_default();
-            let token = token.trim();
-            anyhow::ensure!(
-                !token.is_empty(),
-                "server.admin_token_env: the admin token must be in the {variable} environment variable"
-            );
-            Some(AdminToken::new(token))
-        }
-        None => None,
+/// The admin token, from the variable `server.admin_token_env` names.
+///
+/// Like a backend's key: a variable that is named but empty stops the
+/// start (or the reload), so a typo cannot leave `/metrics` open without
+/// anyone noticing.
+fn admin_token(
+    config: &Config,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> anyhow::Result<Option<AdminToken>> {
+    let Some(variable) = &config.server.admin_token_env else {
+        return Ok(None);
     };
+    let token = env(variable).unwrap_or_default();
+    let token = token.trim();
+    anyhow::ensure!(
+        !token.is_empty(),
+        "server.admin_token_env: the admin token must be in the {variable} environment variable"
+    );
+    Ok(Some(AdminToken::new(token)))
+}
+
+/// The state the handlers share, and the limiters it was built with: the
+/// reloader keeps them, because they hold the Redis connection, which a
+/// reload does not replace.
+fn build_state(
+    config: &Config,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> anyhow::Result<(AppState, Limiters)> {
+    let admin_token = admin_token(config, env)?;
     let metrics = Arc::new(Metrics::new());
-    let cache = config
-        .cache
-        .enabled
-        .then(|| AnswerCache::new(&config.cache, metrics.cache_entries.clone()));
+    let cache = config.cache.enabled.then(|| {
+        Arc::new(AnswerCache::new(
+            &config.cache,
+            metrics.cache_entries.clone(),
+        ))
+    });
     let limiters = Limiters::from_config(config.cluster.as_ref(), env, &metrics)?;
-    Ok(AppState::new(Shared {
+    let shared = Shared {
         registry: ServiceRegistry::from_config(&config.services, &limiters),
         backends: Backends::build(config, env, &limiters, &metrics)?,
-        metrics,
+        metrics: Arc::clone(&metrics),
         estimator: TokenEstimator::new(config.coalescing.bytes_per_token),
         cache,
         request_timeout: millis(config.server.request_timeout_ms),
-        admin_token,
-        ready: AtomicBool::new(false),
-    }))
+    };
+    metrics.stamp_config_loaded();
+    Ok((AppState::new(shared, admin_token), limiters))
 }
 
 #[cfg(test)]

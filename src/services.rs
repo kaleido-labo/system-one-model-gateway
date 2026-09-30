@@ -89,13 +89,26 @@ impl Service {
 }
 
 pub struct ServiceRegistry {
-    services: Vec<Service>,
+    /// Shared so that a reload can hand the same service, with its rate
+    /// limiter and in-flight slots, to the next registry.
+    services: Vec<Arc<Service>>,
     by_key_hash: HashMap<[u8; 32], ServiceId>,
 }
 
 impl ServiceRegistry {
     /// Builds the registry from configuration that already passed validation.
     pub fn from_config(configs: &[ServiceConfig], limiters: &Limiters) -> Self {
+        Self::reusing(configs, limiters, |_| None)
+    }
+
+    /// Like `from_config`, but asks `reuse` for each service first: a service
+    /// it returns is kept as it is, with what it has used of its rate and
+    /// its calls in flight, instead of being built again.
+    pub fn reusing(
+        configs: &[ServiceConfig],
+        limiters: &Limiters,
+        reuse: impl Fn(&ServiceConfig) -> Option<Arc<Service>>,
+    ) -> Self {
         let mut services = Vec::with_capacity(configs.len());
         let mut by_key_hash = HashMap::new();
         for (id, config) in configs.iter().enumerate() {
@@ -105,7 +118,9 @@ impl ServiceRegistry {
                     .expect("key hashes are checked by Config::validate");
                 by_key_hash.insert(digest, id);
             }
-            services.push(Service::from_config(config, limiters));
+            services.push(
+                reuse(config).unwrap_or_else(|| Arc::new(Service::from_config(config, limiters))),
+            );
         }
         Self {
             services,
@@ -124,6 +139,11 @@ impl ServiceRegistry {
 
     pub fn get(&self, id: ServiceId) -> &Service {
         &self.services[id]
+    }
+
+    /// The service called `name`, to be handed to the next registry.
+    pub fn named(&self, name: &str) -> Option<&Arc<Service>> {
+        self.services.iter().find(|service| service.name == name)
     }
 }
 
