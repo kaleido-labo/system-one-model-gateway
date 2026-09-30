@@ -1,85 +1,200 @@
-# systemone-gateway configuration. Every key below [server] and [coalescing]
-# is optional and shows its default value, and so is every [[backend]] key
-# except name (and base_url for a chat backend).
+# systemone-gateway example configuration.
 #
-# The file holds no secret: services are identified by the SHA-256 of their
-# key, and each backend's key comes from the environment variable named in
-# its api_key_env.
+#   cp config.example.toml gateway.toml
+#   systemone-gateway check-config --config gateway.toml   # validate, print a summary
+#   systemone-gateway serve --config gateway.toml          # run
+#
+# The file is read with `--config <path>`, or from SYSTEMONE_GATEWAY_CONFIG, or
+# from ./gateway.toml. Unknown keys are rejected, so a typo fails at startup.
+#
+# It holds no secret: services are identified by the SHA-256 of their key, and
+# each backend's key comes from the environment variable named by its
+# `api_key_env`. The file can live in git or in a Kubernetes ConfigMap.
+#
+# Values that are not commented out below are the defaults, except the
+# service names, key hashes and the `models` lists, which are examples.
+# A commented-out key is optional and has no default unless a value is shown.
+# Full reference: docs/configuration.md
+#
+# Before running this file as it is:
+#   - replace the placeholder key hashes in the [[service]] blocks
+#     (`systemone-gateway gen-key` prints a key and its hash);
+#   - export TYPESAFE_API_KEY and HF_TOKEN, because the gateway refuses to
+#     start when a variable named by `api_key_env` is empty. Delete the
+#     "huggingface" backend if you only use TypeSafe.
+
+# ---------------------------------------------------------------------------
+# [server]: listeners, timeouts, logging
+# ---------------------------------------------------------------------------
 
 [server]
-listen = "0.0.0.0:8080"        # POST /v1/systemone, GET /v1/models
-admin_listen = "0.0.0.0:9090"  # /healthz, /readyz, /metrics
-request_timeout_ms = 9000      # under the TypeSafe SDKs' 10 s default timeout
+# Public API: POST /v1/systemone, GET /v1/models.
+listen = "0.0.0.0:8080"
+# Operations: /healthz, /readyz, /metrics. Keep it off the public network.
+admin_listen = "0.0.0.0:9090"
+# Longest a call may take, queueing included; past it the caller gets a 504.
+# Keep it under the TypeSafe SDKs' default timeout (10 s), so callers see the
+# gateway's 504 instead of a client-side timeout that the SDK retries blindly.
+# Every backend's max_queue_wait_ms must be shorter than this.
+request_timeout_ms = 9000
+# Largest request body accepted, in bytes (2 MiB). Larger gets a 413.
 max_body_bytes = 2097152
-log_format = "text"            # or "json"
+# "text" for a terminal, "json" for log collectors. RUST_LOG sets the level.
+log_format = "text"
 
-# Backends answer the calls. A call goes to the backend whose `models` match
-# its "model" most closely: an exact name first, then the longest prefix
-# ending in `*`. With no [[backend]] at all, every model goes to TypeSafe
-# with its key in TYPESAFE_API_KEY.
+# ---------------------------------------------------------------------------
+# [[backend]]: where calls go, picked by the requested model
+# ---------------------------------------------------------------------------
+#
+# A call goes to the backend whose `models` match the requested model most
+# closely: an exact name first, then the longest prefix ending in `*`. The
+# order of the blocks does not matter, and a pattern may appear in only one
+# backend. A model that no backend serves gets a 422.
+#
+# With no [[backend]] block at all, every model goes to TypeSafe, with its key
+# in TYPESAFE_API_KEY.
 
+# A System One backend: TypeSafe itself, or any server with the same API.
 [[backend]]
+# Shows up in metrics, logs and the x-systemone-gateway-backend header.
+# Letters, digits, '-', '_' and '.'. Required, and unique.
 name = "typesafe"
-protocol = "systemone"         # POST /v1/systemone: TypeSafe, or any server with the same API
+# "systemone" forwards calls to POST <base_url>/v1/systemone, merged calls
+# included. "chat" is the other choice, see the next block.
+protocol = "systemone"
+# Defaults to TypeSafe. Required when protocol = "chat".
 base_url = "https://api.typesafe.ai"
-api_key_env = "TYPESAFE_API_KEY"   # leave out to send no key
+# Environment variable that holds this backend's key, sent as a bearer token.
+# Leave it out to send no key (a server on a private network).
+api_key_env = "TYPESAFE_API_KEY"
+# Model names this backend serves: exact names, `prefix*` patterns, or "*".
 models = ["jev-*"]
-# The backend's limits, shared by every service below. If you run N replicas,
-# give each one 1/N of them.
+
+# Limits of this backend, shared by every service. They are per gateway
+# process: with N replicas, give each one 1/N of them.
 requests_per_minute = 1200
-# burst = 20                   # defaults to one second's worth of requests
+# Requests that may leave back to back. Defaults to one second's worth
+# (requests_per_minute / 60, at least 1).
+# burst = 20
+# Estimated input tokens per second. One second's worth may go at once.
 tokens_per_second = 250000
+# Batches in flight to this backend at the same time.
 max_concurrency = 64
+
+# Time allowed to open a connection, in milliseconds.
 connect_timeout_ms = 2000
+# Time allowed for one attempt, in milliseconds. A retry gets a fresh one.
 attempt_timeout_ms = 5000
+# Retries after the first attempt, for 429, 500, 502, 503, 504, 529 and
+# network errors. 0 turns retries off.
 max_retries = 3
+# Wait before the first retry, doubled each time up to the maximum, with up to
+# 25% jitter. A retry-after or retry-after-ms header from the backend wins.
 backoff_initial_ms = 200
 backoff_max_ms = 3000
-max_queue_wait_ms = 2000       # wait for capacity allowed on top of the merge window;
-                               # past it, callers get 429 + retry-after
+# Longest a call waits for capacity (a request slot, a free connection, the
+# token budget) on top of the merge window. Past it the caller gets a 429 with
+# a retry-after, instead of a late send.
+max_queue_wait_ms = 2000
+# How long this backend's own GET /v1/models answer is kept in memory.
+# protocol = "systemone" only.
 models_cache_ttl_ms = 300000
 
-# A model hosted on Hugging Face, through the Inference Providers router.
-# Services ask for it by its Hugging Face id, such as "Qwen/Qwen2.5-7B-Instruct"
-# (append ":provider" to pin a provider). Each question becomes one chat call
-# that asks for a single token; the answer is read from its logprobs.
+# A chat backend: a generative model behind an OpenAI-compatible chat
+# completions API. Each question becomes one chat request that asks for a
+# single token, and the answer is built from that token's logprobs.
+# See docs/backends.md for what this can and cannot do.
 [[backend]]
 name = "huggingface"
 protocol = "chat"
-base_url = "https://router.huggingface.co/v1"  # or an Inference Endpoint, TGI or vLLM: ".../v1"
+# The URL that `chat/completions` hangs off. Required for a chat backend.
+# Examples: the Hugging Face router, an Inference Endpoint, TGI or vLLM
+# (".../v1"). Append ":provider" to a model name to pin a provider on the
+# router, for example "Qwen/Qwen2.5-7B-Instruct:together".
+base_url = "https://router.huggingface.co/v1"
 api_key_env = "HF_TOKEN"
+# Services ask for these models by their Hugging Face id.
 models = ["Qwen/*", "meta-llama/*"]
-# upstream_model = "Qwen/Qwen2.5-7B-Instruct"  # send this id whatever the service asked for
-top_logprobs = 5               # the router's maximum; vLLM and TGI accept up to 20
-requests_per_minute = 300      # one chat call per question counts here
+
+# Send this model id upstream whatever the service asked for, so that services
+# can use a stable alias such as "my-judge". Chat backends only.
+# upstream_model = "Qwen/Qwen2.5-7B-Instruct"
+# Candidate tokens requested with each answer, from 1 to 20. The Hugging Face
+# router accepts at most 5; vLLM and TGI accept up to 20. Chat backends only.
+top_logprobs = 5
+
+# Every question counts as one request here, so this is a question rate.
+requests_per_minute = 300
+# burst = 5
+# tokens_per_second = 250000
+# max_concurrency = 64
+# connect_timeout_ms = 2000
+# attempt_timeout_ms = 5000
+# max_retries = 3
+# backoff_initial_ms = 200
+# backoff_max_ms = 3000
 max_queue_wait_ms = 2000
-# Extra fields for every chat request. The gateway's own fields win.
+
+# Extra fields added to every chat request, for settings the gateway does not
+# know about. The gateway's own fields (model, messages, max_tokens, logprobs,
+# top_logprobs, stream) win. Chat backends only. For vLLM, this turns thinking
+# off for models that would otherwise start with a thinking token:
 # [backend.request_extras]
 # chat_template_kwargs = { enable_thinking = false }
 
+# ---------------------------------------------------------------------------
+# [coalescing]: merging calls that share a state
+# ---------------------------------------------------------------------------
+
 [coalescing]
-window_ms = 10                 # 0 turns merging off
+# How long a new batch stays open for other calls with the same model, state
+# and top-level fields. It then stays open while it waits for upstream
+# capacity. 0 turns merging off: every call goes upstream on its own.
+window_ms = 10
+# Most distinct questions in one merged call.
 max_questions = 128
-max_request_tokens = 56000     # vendor limit: 64k
-max_state_plus_question_tokens = 28000  # vendor limit: 32k
+# What one merged call may carry, in estimated tokens. They stay under the
+# vendor's limits (64k for the request, 32k for the state plus the longest
+# question) because the estimate is approximate.
+max_request_tokens = 56000
+max_state_plus_question_tokens = 28000
+# Bytes of minified JSON counted as one token. TypeSafe does not publish Jev's
+# tokenizer, so this is a conservative guess.
 bytes_per_token = 3.0
 
-# One block per calling service. Generate a key and its hash with
-#   systemone-gateway gen-key
-# give the key to the service (as TYPESAFE_API_KEY) and put the hash here.
+# ---------------------------------------------------------------------------
+# [[service]]: one block per calling service
+# ---------------------------------------------------------------------------
+#
+# Create a key with `systemone-gateway gen-key --service <name>`, give it to
+# the service (as TYPESAFE_API_KEY for the TypeSafe SDKs), and put the hash
+# here. The gateway never stores the key. At least one service is required.
+#
 # The hashes below are placeholders that match no key.
 
 [[service]]
+# Shows up in metrics and logs. Letters, digits, '-', '_' and '.'. Unique.
 name = "ocr-service"
+# SHA-256 of the service's key, in hex (64 characters). Unique across services.
 key_sha256 = ["0000000000000000000000000000000000000000000000000000000000000001"]
+# This service's own share of requests per minute. Unset: bounded only by the
+# backends' limits. Over it, the service gets a 429.
 requests_per_minute = 600
+# Requests the service may send back to back. Defaults to ten seconds' worth
+# of its rate (requests_per_minute / 6, at least 1).
+# burst = 100
+# Calls the service may have in flight at once. Unset: no limit of its own.
 max_concurrent = 32
+# Models the service may ask for, as exact names or `prefix*` patterns.
+# Unset: any model. Another model gets a 403.
+# allowed_models = ["jev-*"]
 
 [[service]]
-name = "receipt-location"
+name = "fraud-check"
+# Two hashes let you rotate a key without downtime: add the new hash, move the
+# service to the new key, then remove the old hash.
 key_sha256 = [
   "0000000000000000000000000000000000000000000000000000000000000002",
-  # A second hash lets you rotate the key without downtime.
   "0000000000000000000000000000000000000000000000000000000000000003",
 ]
 requests_per_minute = 300
