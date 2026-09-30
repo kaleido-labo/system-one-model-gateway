@@ -10,8 +10,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
-use crate::config::ServiceConfig;
-use crate::pattern::{ModelPattern, best_match, parse_all};
+use crate::config::{ModelPattern, ServiceConfig, best_match, parse_all};
 use crate::scheduling::Gcra;
 
 pub type ServiceId = usize;

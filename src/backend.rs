@@ -15,10 +15,9 @@ use tokio::sync::Mutex;
 use tokio::time::{Instant, sleep_until};
 
 use crate::chat::ChatEngine;
-use crate::config::{BackendConfig, Config, Protocol, millis};
+use crate::config::{BackendConfig, Config, ModelPattern, Protocol, best_match, millis, parse_all};
 use crate::error::GatewayError;
 use crate::metrics::Metrics;
-use crate::pattern::{ModelPattern, best_match, parse_all};
 use crate::scheduling::{BatchLimits, Coalescer, Dispatcher, Gcra, Outcome};
 use crate::upstream::{ApiKey, RetryPolicy, Upstream, UpstreamFailure, UpstreamReply};
 use crate::wire::{Invalid, PreparedRequest};

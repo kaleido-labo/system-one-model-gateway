@@ -15,7 +15,6 @@ mod chat;
 mod config;
 mod error;
 mod metrics;
-mod pattern;
 mod scheduling;
 mod services;
 mod upstream;

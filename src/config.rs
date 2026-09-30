@@ -12,7 +12,9 @@ use std::time::Duration;
 use anyhow::{Context, bail, ensure};
 use serde::Deserialize;
 
-use crate::pattern::ModelPattern;
+mod pattern;
+
+pub use pattern::{ModelPattern, best_match, parse_all};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
