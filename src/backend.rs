@@ -14,13 +14,19 @@ use serde_json::value::RawValue;
 use tokio::sync::Mutex;
 use tokio::time::{Instant, sleep_until};
 
-use crate::chat::ChatEngine;
 use crate::config::{BackendConfig, Config, ModelPattern, Protocol, best_match, millis, parse_all};
 use crate::error::GatewayError;
 use crate::metrics::Metrics;
 use crate::scheduling::{BatchLimits, Coalescer, Dispatcher, Gcra, Outcome};
-use crate::upstream::{ApiKey, RetryPolicy, Upstream, UpstreamFailure, UpstreamReply};
 use crate::wire::{Invalid, PreparedRequest};
+
+mod chat;
+mod upstream;
+
+use chat::ChatEngine;
+pub use upstream::{
+    ApiKey, REQUEST_ID, RetryPolicy, Upstream, UpstreamFailure, UpstreamReply, describe,
+};
 
 /// How a backend answers a System One request.
 pub enum Engine {

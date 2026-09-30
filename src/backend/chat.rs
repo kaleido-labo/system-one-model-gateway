@@ -31,7 +31,7 @@ use serde_json::{Map, Value, json};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep_until};
 
-use crate::upstream::{Upstream, UpstreamFailure, UpstreamReply};
+use crate::backend::{Upstream, UpstreamFailure, UpstreamReply};
 use crate::wire::{Invalid, ObjectWriter, PreparedRequest, minify};
 
 /// Most options a Choice question may have on a chat backend: one letter each.

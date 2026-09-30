@@ -287,10 +287,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::Engine;
+    use crate::backend::{ApiKey, Engine, RetryPolicy, Upstream};
     use crate::metrics::Metrics;
     use crate::scheduling::limiter::Gcra;
-    use crate::upstream::{ApiKey, RetryPolicy, Upstream};
     use crate::wire::TokenEstimator;
     use serde_json::json;
 

@@ -11,12 +11,11 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::{Instant, sleep_until, timeout_at};
 use tracing::{debug, error, warn};
 
-use crate::backend::Engine;
+use crate::backend::{Engine, UpstreamFailure, describe};
 use crate::error::GatewayError;
 use crate::metrics::Metrics;
 use crate::scheduling::batch::{Plan, SplitError};
 use crate::scheduling::limiter::Gcra;
-use crate::upstream::{UpstreamFailure, describe};
 use crate::wire::{PreparedRequest, input_tokens};
 
 /// Shortest retry-after the gateway suggests when it sheds a call.

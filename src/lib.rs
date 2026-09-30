@@ -11,13 +11,11 @@
 mod api;
 mod app;
 mod backend;
-mod chat;
 mod config;
 mod error;
 mod metrics;
 mod scheduling;
 mod services;
-mod upstream;
 mod wire;
 
 pub use app::Gateway;
