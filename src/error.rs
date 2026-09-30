@@ -79,6 +79,19 @@ impl GatewayError {
         }
     }
 
+    /// Every backend that could serve the call is failing, and the gateway
+    /// knows it: `retry_after` is when one is worth trying again.
+    pub fn unavailable(message: impl Into<String>, retry_after: Duration) -> Self {
+        Self {
+            retry_after: Some(retry_after),
+            ..Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable_error",
+                message,
+            )
+        }
+    }
+
     pub fn upstream(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_GATEWAY, "upstream_error", message)
     }
@@ -157,6 +170,17 @@ mod tests {
         assert_eq!(body["error"]["type"], "validation_error");
         assert_eq!(body["error"]["param"], "questions.q.criteria");
         assert_eq!(body["error"]["message"], "questions.q.criteria is required");
+    }
+
+    #[tokio::test]
+    async fn unavailable_backends_carry_both_retry_after_headers() {
+        let response =
+            GatewayError::unavailable("backend down", Duration::from_millis(4_200)).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[RETRY_AFTER], "5");
+        assert_eq!(response.headers()[RETRY_AFTER_MS], "4200");
+        let body = body_of(response).await;
+        assert_eq!(body["error"]["type"], "unavailable_error");
     }
 
     #[tokio::test]

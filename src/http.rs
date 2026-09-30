@@ -126,6 +126,8 @@ fn outcome_response(state: &Shared, service: &str, backend: &str, outcome: Outco
             (StatusCode::OK, headers, body).into_response()
         }
         Outcome::Failed(error) => error.into_response(),
+        // No fallback took over: the caller gets what the backend gave.
+        Outcome::Unavailable(outcome) => outcome_response(state, service, backend, *outcome),
         Outcome::Rejected {
             status,
             body,

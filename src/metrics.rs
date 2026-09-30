@@ -4,6 +4,7 @@ use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
+use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
 
@@ -31,6 +32,14 @@ pub struct UpstreamLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct FallbackLabels {
+    /// The backend the model routes to.
+    pub from: String,
+    /// The backend that took the call instead.
+    pub to: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct TokenLabels {
     pub service: String,
     pub backend: String,
@@ -47,6 +56,8 @@ pub struct Metrics {
     pub upstream_calls: Family<UpstreamLabels, Counter>,
     pub upstream_duration: HistogramFamily<BackendLabels>,
     pub upstream_retries: Family<BackendLabels, Counter>,
+    pub circuit_state: Family<BackendLabels, Gauge>,
+    pub fallback_calls: Family<FallbackLabels, Counter>,
     pub batch_callers: Histogram,
     pub batch_questions: Histogram,
     pub deduplicated_questions: Counter,
@@ -108,6 +119,18 @@ impl Metrics {
             "Upstream attempts retried after a 429, 529, 5xx or network error",
             upstream_retries.clone(),
         );
+        let circuit_state = Family::<BackendLabels, Gauge>::default();
+        registry.register(
+            "circuit_state",
+            "Circuit breaker of each backend: 0 closed, 1 half-open (one trial call allowed), 2 open (calls turned away)",
+            circuit_state.clone(),
+        );
+        let fallback_calls = Family::<FallbackLabels, Counter>::default();
+        registry.register(
+            "fallback_calls",
+            "Calls served by a fallback backend (to) instead of the backend their model routes to (from)",
+            fallback_calls.clone(),
+        );
         let batch_callers = Histogram::new([1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 32.0, 64.0]);
         registry.register(
             "batch_callers",
@@ -154,6 +177,8 @@ impl Metrics {
             upstream_calls,
             upstream_duration,
             upstream_retries,
+            circuit_state,
+            fallback_calls,
             batch_callers,
             batch_questions,
             deduplicated_questions,
@@ -172,6 +197,13 @@ impl Metrics {
     pub fn backend(name: &str) -> BackendLabels {
         BackendLabels {
             backend: name.to_owned(),
+        }
+    }
+
+    pub fn fallback(from: &str, to: &str) -> FallbackLabels {
+        FallbackLabels {
+            from: from.to_owned(),
+            to: to.to_owned(),
         }
     }
 

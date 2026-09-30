@@ -11,7 +11,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::{Instant, sleep_until, timeout_at};
 use tracing::{debug, error, warn};
 
-use crate::backend::{Engine, UpstreamFailure, describe};
+use crate::backend::{CircuitBreaker, Engine, UpstreamFailure, Verdict, describe};
 use crate::error::GatewayError;
 use crate::metrics::Metrics;
 use crate::scheduling::batch::{Plan, SplitError};
@@ -46,6 +46,11 @@ pub enum Outcome {
     },
     /// An error the gateway answers itself.
     Failed(GatewayError),
+    /// The backend could not serve the call: unreachable, erroring, or
+    /// refusing the gateway's key. Holds what the caller gets if no fallback
+    /// takes over. A call the backend refused for its own faults (a 400) or
+    /// its rate (a 429) is not this: another backend would not do better.
+    Unavailable(Box<Outcome>),
     /// An error status from the backend, handed back as it was sent.
     Rejected {
         status: StatusCode,
@@ -57,6 +62,20 @@ pub enum Outcome {
 
 impl Outcome {
     pub fn from_failure(backend: &str, failure: &UpstreamFailure) -> Self {
+        let outcome = Self::describe_failure(backend, failure);
+        if Verdict::of_failure(failure) == Verdict::Failed {
+            Self::Unavailable(Box::new(outcome))
+        } else {
+            outcome
+        }
+    }
+
+    /// Whether a fallback backend could do better than this outcome.
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, Self::Unavailable(_))
+    }
+
+    fn describe_failure(backend: &str, failure: &UpstreamFailure) -> Self {
         match failure {
             UpstreamFailure::Status { status, .. } if *status == StatusCode::UNAUTHORIZED => {
                 // The caller's key was fine; the gateway's own key is not.
@@ -111,6 +130,8 @@ pub struct Dispatcher {
     /// out in the order they became ready.
     permits: Arc<Semaphore>,
     metrics: Arc<Metrics>,
+    /// Told how every upstream call went.
+    breaker: Arc<CircuitBreaker>,
 }
 
 impl Dispatcher {
@@ -129,7 +150,14 @@ impl Dispatcher {
             token_pacer,
             permits: Arc::new(Semaphore::new(max_concurrency)),
             metrics,
+            breaker: Arc::new(CircuitBreaker::disabled(backend)),
         }
+    }
+
+    /// Reports the outcome of every upstream call to `breaker`.
+    pub fn with_breaker(mut self, breaker: Arc<CircuitBreaker>) -> Self {
+        self.breaker = breaker;
+        self
     }
 
     pub fn pacer(&self) -> &Gcra {
@@ -246,6 +274,9 @@ impl Dispatcher {
         let sent = Instant::now();
         let result = self.engine.execute(plan.body.clone(), deadline).await;
         drop(permit);
+        // One upstream call is one verdict, however many callers it carried.
+        self.breaker
+            .record(sent, Instant::now(), Verdict::of(&result));
 
         match result {
             Ok(reply) => {
