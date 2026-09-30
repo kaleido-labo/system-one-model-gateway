@@ -33,6 +33,7 @@ use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep_until};
+use tracing::Instrument;
 
 use crate::backend::{Upstream, UpstreamFailure, UpstreamReply};
 use crate::wire::{Invalid, ObjectWriter, PreparedRequest};
@@ -151,10 +152,15 @@ impl ChatEngine {
             let body = Bytes::from(self.request_body(&model, prompt));
             let upstream = Arc::clone(&self.upstream);
             let url = self.url.clone();
-            calls.spawn(async move {
-                sleep_until(slot).await;
-                (index, upstream.post(&url, body, deadline).await)
-            });
+            // A spawned task starts outside the batch's span: carry it over,
+            // or the attempts would be traces of their own.
+            calls.spawn(
+                async move {
+                    sleep_until(slot).await;
+                    (index, upstream.post(&url, body, deadline).await)
+                }
+                .in_current_span(),
+            );
         }
         let mut replies: Vec<Option<UpstreamReply>> = prompts.iter().map(|_| None).collect();
         while let Some(joined) = calls.join_next().await {

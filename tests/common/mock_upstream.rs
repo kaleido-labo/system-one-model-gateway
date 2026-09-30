@@ -61,6 +61,8 @@ pub struct MockState {
     chat_received: Mutex<Vec<String>>,
     /// When each of them arrived.
     arrivals: Mutex<Vec<std::time::Instant>>,
+    /// Headers of every request, by path, in arrival order.
+    request_headers: Mutex<Vec<(&'static str, HeaderMap)>>,
     script: Mutex<VecDeque<Scripted>>,
     delay: Mutex<Duration>,
     models_calls: AtomicUsize,
@@ -88,6 +90,24 @@ impl MockState {
             .into_iter()
             .map(|(id, question)| (id, question["instructions"].clone()))
             .collect()
+    }
+
+    /// Headers of every request received on `path`, oldest first.
+    pub fn headers_on(&self, path: &str) -> Vec<HeaderMap> {
+        self.request_headers
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(seen, _)| *seen == path)
+            .map(|(_, headers)| headers.clone())
+            .collect()
+    }
+
+    fn record_headers(&self, path: &'static str, headers: &HeaderMap) {
+        self.request_headers
+            .lock()
+            .unwrap()
+            .push((path, headers.clone()));
     }
 
     pub fn push(&self, response: Scripted) {
@@ -137,6 +157,7 @@ impl MockUpstream {
             received: Mutex::new(Vec::new()),
             chat_received: Mutex::new(Vec::new()),
             arrivals: Mutex::new(Vec::new()),
+            request_headers: Mutex::new(Vec::new()),
             script: Mutex::new(VecDeque::new()),
             delay: Mutex::new(Duration::ZERO),
             models_calls: AtomicUsize::new(0),
@@ -187,6 +208,7 @@ async fn systemone(
     body: Bytes,
 ) -> Response {
     // Recorded before the key check, so a test sees every attempt made.
+    state.record_headers("/v1/systemone", &headers);
     let text = String::from_utf8(body.to_vec()).unwrap();
     let call = {
         let mut received = state.received.lock().unwrap();
@@ -279,6 +301,7 @@ fn answer(question: &Value) -> Value {
 }
 
 async fn models(State(state): State<Arc<MockState>>, headers: HeaderMap) -> Response {
+    state.record_headers("/v1/models", &headers);
     if !authorized(&state, &headers) {
         return json_response(401, &[], json!({"detail": "Invalid API key"}).to_string());
     }
@@ -291,6 +314,7 @@ async fn models(State(state): State<Arc<MockState>>, headers: HeaderMap) -> Resp
 }
 
 async fn chat(State(state): State<Arc<MockState>>, headers: HeaderMap, body: Bytes) -> Response {
+    state.record_headers("/v1/chat/completions", &headers);
     let text = String::from_utf8(body.to_vec()).unwrap();
     let call = {
         let mut received = state.chat_received.lock().unwrap();

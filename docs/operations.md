@@ -6,6 +6,7 @@ Running, watching and tuning the gateway.
 - [Kubernetes](#kubernetes)
 - [Logs](#logs)
 - [Metrics](#metrics)
+- [Traces](#traces)
 - [Tuning](#tuning)
 - [Timeouts and queue deadlines](#timeouts-and-queue-deadlines)
 - [Known limits](#known-limits)
@@ -48,7 +49,8 @@ docker run -p 8080:8080 -p 9090:9090 \
   `GET /readyz`, both on port 9090.
 - On SIGTERM the gateway stops accepting connections and lets in-flight calls
   finish. Set `terminationGracePeriodSeconds` a few seconds above
-  `server.request_timeout_ms`.
+  `server.request_timeout_ms` (five more when [tracing](#traces) is on, for the
+  last spans).
 - Scrape `GET /metrics` on port 9090. With `server.admin_token_env` configured,
   `/metrics` needs `Authorization: Bearer <token>`: give the scraper the same
   token, as in the Prometheus example below. The probes need no header, because
@@ -175,6 +177,7 @@ and timings.
 
 | Level | Line | When |
 | --- | --- | --- |
+| info | `exporting traces` | Startup, only when [tracing](#traces) is on: the collector URL, where the setting came from, the service name and the sample ratio. |
 | info | `gateway listening` | Startup, with the addresses and the number of services and backends. |
 | info | `finished processing request` | Every call on the public port, with `method`, `path`, `request_id`, `service`, `status` and `latency`. `service` is missing when the call was refused before authentication. |
 | warn | `retrying the upstream call` | A retry, with `backend`, `attempt`, `delay_ms` and `failure`. |
@@ -190,6 +193,10 @@ and timings.
 | debug | `upstream call answered` | One per upstream call, with the callers and questions it carried. |
 
 The `x-request-id` of a response is the `request_id` of its log line.
+
+When [tracing](#traces) is on and the collector cannot be reached, the exporter
+logs its own lines: a `warn` saying that the OTLP export exhausted its retries,
+and an `error` from `opentelemetry_sdk` with the cause. Calls are not affected.
 
 ## Metrics
 
@@ -290,6 +297,115 @@ sum by (backend) (rate(systemone_gateway_cache_hits_total[5m]))
   / (sum by (backend) (rate(systemone_gateway_cache_hits_total[5m]))
      + sum by (backend) (rate(systemone_gateway_cache_misses_total[5m])))
 ```
+
+## Traces
+
+Logs and metrics tell you how the gateway behaves. A trace tells one caller
+what happened to its own call, including what it shared with others inside a
+merged batch. The gateway exports traces with OpenTelemetry, and only when you
+ask for it.
+
+### Turning it on
+
+Point the gateway at an OTLP/HTTP collector, in the file or in the environment
+(the [configuration reference](configuration.md#tracing) lists the keys and
+which one wins):
+
+```toml
+[tracing]
+otlp_endpoint = "http://otel-collector:4318"   # the gateway posts to /v1/traces
+# service_name = "systemone-gateway"
+# sample_ratio = 1.0
+```
+
+```sh
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318 systemone-gateway serve
+```
+
+`check-config` prints the endpoint the gateway would use, and `serve` logs an
+`exporting traces` line at startup. With no endpoint, no exporter exists and the
+gateway neither reads nor sends a `traceparent`: a run without tracing behaves
+as it did before tracing existed.
+
+The exporter speaks OTLP over HTTP with protobuf, not gRPC, so use the
+collector's port 4318. Headers for a hosted collector go in
+`OTEL_EXPORTER_OTLP_HEADERS`.
+
+### What a trace shows
+
+```
+POST /v1/systemone            the call: from receiving it to answering it
+  └─ systemone.batch          the upstream call that carried it
+       ├─ upstream.attempt    one per HTTP attempt to the backend
+       └─ upstream.attempt    the retry, if there was one
+```
+
+`GET /v1/models` makes a `GET /v1/models` span with its `upstream.attempt`
+spans directly under it, because a model list is never merged.
+
+A batch serves several callers, and a span has one parent. The gateway makes the
+batch span a child of the call that opened the batch, and links the other calls
+to it:
+
+- A call that is not merged, which is the usual case, has its whole story in its
+  own trace: the call, the batch and the attempts. The `traceparent` sent to the
+  backend carries that trace's id, so a backend that traces continues it.
+- When calls are merged, the batch and its attempts sit in the trace of the call
+  that opened the batch. Every other call has a span link to the batch span, and
+  the batch span has a link back to each of them. From any caller's span, you
+  reach the batch, its attempts and the other callers in one click; in
+  `gateway.batch_callers` you can also read how many calls shared it.
+- A caller that joined a batch does not see the attempts in its own trace, only
+  the link. That is the price of one upstream call serving everyone: it cannot
+  also be a child of each of them.
+
+The time between the start of the batch span and the first attempt is the wait
+for the merge window, a request slot, a connection and the token budget. It is
+also in `gateway.queue_wait_ms`, the same number the `queue_wait_seconds`
+histogram observes. A call that is replayed alone after a merged call was
+rejected gets a new batch span, a child of its own call, with
+`gateway.batch.replay` set.
+
+| Span | Kind | Attributes |
+| --- | --- | --- |
+| `POST /v1/systemone`, `GET /v1/models` | server | `http.request.method`, `http.route`, `http.response.status_code`, `gateway.request_id`, `gateway.service`; for a System One call also `gateway.backend`, `gateway.model` and `gateway.batch_callers`. Status `Error` for a 5xx. |
+| `systemone.batch` | internal | `gateway.backend`, `gateway.model`, `gateway.batch.callers`, `gateway.batch.questions`, `gateway.batch.deduplicated`, `gateway.queue_wait_ms`. Status `Error` when the backend call failed. |
+| `upstream.attempt` | client | `gateway.backend`, `http.request.method`, `gateway.attempt` (from 1), `http.response.status_code`, `error.type`, and `gateway.retry_delay_ms`, the wait before the retry that followed a failed attempt. Status `Error` for a failed attempt. |
+
+`gateway.request_id` is the `x-request-id` of the response and of the log line,
+which is how you go from a log line to its trace. A chat backend makes one
+`upstream.attempt` per question, all under the batch span.
+
+Spans never carry a state or a question, only the names above. A refused call is
+traced too, with its status: a call refused before authentication (401) makes a
+span of its own, because the gateway does not yet know who is asking.
+
+### Sampling and propagation
+
+- **Incoming.** The gateway reads W3C `traceparent` and `tracestate` from
+  `POST /v1/systemone` and `GET /v1/models`, and makes its span a child of the
+  caller's. A missing or malformed header starts a new trace. The header is read
+  only after the caller's key has been accepted: a `traceparent` carries a
+  sampled flag, and honouring it from anyone on the network would let anyone
+  make the gateway record spans.
+- **Sampling.** The decision is parent-based. A call that arrives with a
+  `traceparent` is kept or dropped as its caller decided, and `sample_ratio`
+  applies to the traces the gateway starts itself. A dropped trace costs no
+  export, but the gateway still passes the `traceparent` on, with its sampled
+  flag off, so the decision holds down the chain.
+- **Outgoing.** Every upstream request, to a System One backend or a chat
+  backend, carries `traceparent` and `tracestate` for its `upstream.attempt`
+  span. TypeSafe and Hugging Face are free to ignore them.
+
+### Shutdown, failures and cost
+
+- Spans leave in batches from a thread of their own, every few seconds. On
+  SIGTERM, once the servers have stopped, the gateway sends what is still
+  queued, waiting at most 5 seconds. Count them in `terminationGracePeriodSeconds`.
+- A collector that is down, slow or full never slows a call. The exporter drops
+  spans it cannot send, and logs the failure (see [Logs](#logs)).
+- With tracing on, each call costs a few spans. Lower `sample_ratio`, or have the
+  callers sample, if that is too much.
 
 ## Tuning
 

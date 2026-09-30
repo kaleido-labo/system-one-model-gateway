@@ -1,18 +1,20 @@
 //! The HTTP client of one backend: authentication, the request pacer, retries
-//! (see `retry`) and the metrics of every call.
+//! (see `retry`), the metrics of every call and one trace span per attempt.
 
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::http::header::{ACCEPT, CONTENT_TYPE};
 use bytes::Bytes;
 use tokio::time::{Instant, sleep_until};
-use tracing::warn;
+use tracing::{Instrument, Span, warn};
 
 use crate::metrics::{Metrics, UpstreamLabels};
 use crate::scheduling::Limiter;
+use crate::telemetry;
 
 mod reply;
 mod retry;
@@ -151,8 +153,22 @@ impl Upstream {
                 break Err(last_failure.unwrap_or(UpstreamFailure::Deadline));
             }
 
+            // The span lives until the end of the iteration, to say how long
+            // the retry that followed waited. Its duration is the attempt's
+            // own: a span ends when it was last exited.
+            let span = telemetry::attempt(
+                &self.name,
+                if body.is_some() { "POST" } else { "GET" },
+                attempt + 1,
+            );
             let failure = match self
-                .attempt(url, body.clone(), remaining.min(self.retry.attempt_timeout))
+                .attempt(
+                    url,
+                    body.clone(),
+                    remaining.min(self.retry.attempt_timeout),
+                    &span,
+                )
+                .instrument(span.clone())
                 .await
             {
                 Ok(reply) => break Ok(reply),
@@ -184,10 +200,12 @@ impl Upstream {
                 self.pacer.adjust(-1).await;
                 break Err(failure);
             }
+            let delay_ms = retry_at.saturating_duration_since(now).as_millis() as u64;
+            span.record("gateway.retry_delay_ms", delay_ms);
             warn!(
                 backend = %self.name,
                 attempt = attempt + 1,
-                delay_ms = retry_at.saturating_duration_since(now).as_millis() as u64,
+                delay_ms,
                 failure = %describe(&failure),
                 "retrying the upstream call"
             );
@@ -232,6 +250,7 @@ impl Upstream {
         url: &reqwest::Url,
         body: Option<Bytes>,
         timeout: Duration,
+        span: &Span,
     ) -> Result<UpstreamReply, UpstreamFailure> {
         let mut request = match body {
             Some(body) => self
@@ -244,12 +263,16 @@ impl Upstream {
         if let Some(key) = &self.api_key {
             request = request.bearer_auth(&key.0);
         }
+        // Lets the backend, if it traces, continue the caller's trace.
+        let mut trace_headers = HeaderMap::new();
+        telemetry::inject(span, &mut trace_headers);
         let response = request
+            .headers(trace_headers)
             .header(ACCEPT, "application/json")
             .timeout(timeout)
             .send()
             .await
-            .map_err(transport_failure)?;
+            .map_err(|err| traced(span, transport_failure(err)))?;
 
         let status = response.status();
         let request_id = [REQUEST_ID, GENERIC_REQUEST_ID]
@@ -262,10 +285,15 @@ impl Upstream {
                     .map(str::to_owned)
             });
         let retry_after = parse_retry_after(response.headers(), SystemTime::now());
-        let body = response.bytes().await.map_err(transport_failure)?;
+        let body = response
+            .bytes()
+            .await
+            .map_err(|err| traced(span, transport_failure(err)))?;
         if status.is_success() {
+            telemetry::attempt_ok(span, status.as_u16());
             Ok(UpstreamReply { body, request_id })
         } else {
+            telemetry::attempt_failed(span, Some(status.as_u16()), "");
             Err(UpstreamFailure::Status {
                 status,
                 body,
@@ -274,6 +302,18 @@ impl Upstream {
             })
         }
     }
+}
+
+/// Notes a transport failure on the attempt's span, and passes it on.
+fn traced(span: &Span, failure: UpstreamFailure) -> UpstreamFailure {
+    if let UpstreamFailure::Transport { timed_out, .. } = &failure {
+        telemetry::attempt_failed(
+            span,
+            None,
+            if *timed_out { "timeout" } else { "connection" },
+        );
+    }
+    failure
 }
 
 fn transport_failure(err: reqwest::Error) -> UpstreamFailure {

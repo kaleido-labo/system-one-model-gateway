@@ -2,6 +2,11 @@
 //! routes it to a backend, queues it for merging and turns the outcome into
 //! an HTTP response. When the answer cache is on, a call may be answered from
 //! it, in whole or in part, before it reaches the batcher (`cached`).
+//!
+//! Two spans are open while a call is handled: the log span of the router,
+//! which `Span::current()` is before the trace span is entered, and the trace
+//! span (see `telemetry`). Fields go to each by name, never through
+//! `Span::current()`, which would reach only the innermost.
 
 use std::time::Duration;
 
@@ -11,14 +16,15 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use tokio::sync::oneshot;
 use tokio::time::{Instant, timeout_at};
-use tracing::Span;
+use tracing::{Instrument, Span};
 
-use super::{AppState, BACKEND, CACHE, Shared, json_headers, outcome_response};
+use super::{AppState, BACKEND, CACHE, Shared, json_headers, outcome_response, request_id};
 use crate::backend::Backend;
 use crate::error::GatewayError;
 use crate::metrics::{CallLabels, Metrics};
 use crate::scheduling::{MIN_RETRY_AFTER, Outcome, Saturated};
 use crate::services::{Refusal, ServiceId};
+use crate::telemetry;
 use crate::wire::{Invalid, PreparedRequest, RequestError};
 
 /// Least time a call must have left for a fallback to be worth trying after
@@ -36,14 +42,25 @@ pub(super) async fn systemone(
     body: Bytes,
 ) -> Response {
     let arrived = Instant::now();
-    let Some(service_id) = state.0.registry.authenticate(&headers) else {
-        record_call(&state.0.metrics, "-", StatusCode::UNAUTHORIZED, arrived);
-        return GatewayError::unauthorized().into_response();
-    };
-    let service = state.0.registry.get(service_id);
-    Span::current().record("service", service.name.as_str());
-    let response = handle_systemone(&state.0, service_id, &headers, &body, arrived).await;
-    record_call(&state.0.metrics, &service.name, response.status(), arrived);
+    let log_span = Span::current();
+    let call = telemetry::systemone_call(request_id(&headers));
+    let response = async {
+        let Some(service_id) = state.0.registry.authenticate(&headers) else {
+            record_call(&state.0.metrics, "-", StatusCode::UNAUTHORIZED, arrived);
+            return GatewayError::unauthorized().into_response();
+        };
+        telemetry::adopt_caller(&call, &headers);
+        let service = state.0.registry.get(service_id);
+        log_span.record("service", service.name.as_str());
+        call.record("gateway.service", service.name.as_str());
+        let response =
+            handle_systemone(&state.0, service_id, &headers, &body, arrived, &call).await;
+        record_call(&state.0.metrics, &service.name, response.status(), arrived);
+        response
+    }
+    .instrument(call.clone())
+    .await;
+    telemetry::finish_call(&call, response.status());
     response
 }
 
@@ -53,6 +70,7 @@ async fn handle_systemone(
     headers: &HeaderMap,
     body: &[u8],
     arrived: Instant,
+    call: &Span,
 ) -> Response {
     let service = state.registry.get(service_id);
     let mut request = match PreparedRequest::parse(body, &state.estimator) {
@@ -77,6 +95,8 @@ async fn handle_systemone(
         ))
         .into_response();
     };
+    call.record("gateway.backend", primary.name.as_str());
+    call.record("gateway.model", request.model.as_str());
     if let Err(invalid) = primary.check(&request) {
         return GatewayError::invalid(invalid).into_response();
     }
@@ -145,6 +165,8 @@ async fn handle_systemone(
     let mut failed: Option<(&Backend, Outcome)> = None;
     while let Some((index, backend)) = choose(&chain, next, &request, &mut wait) {
         next = index + 1;
+        // The backend that answers is the one the span names.
+        call.record("gateway.backend", backend.name.as_str());
         // The first backend gets the call as it arrived. A fallback gets it
         // now: the queue deadline is about waiting for capacity there, and
         // the time lost on the backend before does not count against it.
@@ -200,6 +222,9 @@ async fn handle_systemone(
         // no state on the backend.
         let has_time = deadline.saturating_duration_since(Instant::now()) >= MIN_FALLBACK_BUDGET;
         if !(outcome.is_unavailable() && next < chain.len() && has_time) {
+            if let Outcome::Answered { batch_callers, .. } = &outcome {
+                call.record("gateway.batch_callers", *batch_callers as u64);
+            }
             // Only the routed backend's answers are kept: a fallback's would
             // otherwise stand in for the routed model's until they expire,
             // long after that backend is back.

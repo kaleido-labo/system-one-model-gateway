@@ -81,11 +81,7 @@ pub fn public_router(state: AppState, max_body_bytes: usize) -> Router {
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(|request: &Request<Body>| {
-                    let request_id = request
-                        .headers()
-                        .get("x-request-id")
-                        .and_then(|value| value.to_str().ok())
-                        .unwrap_or("-");
+                    let request_id = request_id(request.headers());
                     // Never the body: states and questions can carry
                     // personal or financial data.
                     tracing::info_span!(
@@ -151,6 +147,15 @@ fn outcome_response(state: &Shared, service: &str, backend: &str, outcome: Outco
             (status, headers, body).into_response()
         }
     }
+}
+
+/// The `x-request-id` of a request, set by the router before any handler
+/// runs: the id that logs, traces and the response header share.
+fn request_id(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-")
 }
 
 fn json_headers(request_id: Option<&str>) -> HeaderMap {

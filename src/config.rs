@@ -1,6 +1,7 @@
 //! Gateway configuration, read from a TOML file: the server, the merge window,
-//! the backends (`backend`), the services allowed to call the gateway and,
-//! optionally, the Redis that replicas share their pacing through.
+//! the backends (`backend`), tracing (`traces`), the services allowed to call
+//! the gateway and, optionally, the Redis that replicas share their pacing
+//! through.
 //!
 //! The file holds no secret: services are identified by the SHA-256 of their
 //! key, and each backend's key and the Redis URL are read from the
@@ -18,10 +19,12 @@ use serde::Deserialize;
 mod backend;
 mod cluster;
 mod pattern;
+mod traces;
 
 pub use backend::{BackendConfig, Protocol};
 pub use cluster::ClusterConfig;
 pub use pattern::{ModelPattern, best_match, parse_all};
+pub use traces::{TracesEndpoint, TracingConfig};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,6 +41,8 @@ pub struct Config {
     pub coalescing: CoalescingConfig,
     #[serde(default)]
     pub cache: CacheConfig,
+    #[serde(default)]
+    pub tracing: TracingConfig,
     #[serde(default, rename = "service")]
     pub services: Vec<ServiceConfig>,
     /// Present only when replicas share their pacing through Redis.
@@ -275,6 +280,7 @@ impl Config {
         if let Some(cluster) = &self.cluster {
             cluster.validate()?;
         }
+        self.tracing.validate()?;
 
         if self.services.is_empty() {
             bail!("no [[service]] configured: nobody could call the gateway");
@@ -403,6 +409,31 @@ mod tests {
         assert!(backend.cache);
         assert_eq!(config.server.listen.port(), 8080);
         assert_eq!(config.services[0].burst(), None);
+    }
+
+    #[test]
+    fn tracing_is_off_by_default_and_its_table_is_strict() {
+        let config = Config::from_toml(&with_service("")).unwrap();
+        assert_eq!(config.tracing.otlp_endpoint, None);
+        assert_eq!(config.tracing.service_name, "systemone-gateway");
+        assert_eq!(config.tracing.sample_ratio, 1.0);
+
+        let on = format!(
+            "[tracing]\notlp_endpoint = \"http://collector:4318\"\nsample_ratio = 0.25\n{}",
+            with_service("")
+        );
+        let config = Config::from_toml(&on).unwrap();
+        assert_eq!(
+            config.tracing.otlp_endpoint.as_deref(),
+            Some("http://collector:4318")
+        );
+        assert_eq!(config.tracing.sample_ratio, 0.25);
+
+        let typo = format!("[tracing]\nsample_rate = 0.5\n{}", with_service(""));
+        assert!(Config::from_toml(&typo).is_err());
+        let too_much = format!("[tracing]\nsample_ratio = 2\n{}", with_service(""));
+        let err = Config::from_toml(&too_much).unwrap_err();
+        assert!(err.to_string().contains("tracing.sample_ratio"), "{err}");
     }
 
     #[test]

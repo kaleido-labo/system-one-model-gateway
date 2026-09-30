@@ -17,9 +17,11 @@ use std::time::Duration;
 
 use tokio::sync::oneshot;
 use tokio::time::{Instant, sleep_until};
+use tracing::Span;
 
 use crate::error::GatewayError;
 use crate::scheduling::dispatch::{Dispatcher, MIN_RETRY_AFTER, Member, Outcome};
+use crate::telemetry;
 use crate::wire::{BatchKey, PreparedRequest};
 
 mod members;
@@ -51,6 +53,8 @@ struct Batch {
     opened: Instant,
     send_at: Instant,
     members: Mutex<Members>,
+    /// The batch in the trace, from the first call to the last answer.
+    span: Span,
 }
 
 impl Coalescer {
@@ -83,6 +87,8 @@ impl Coalescer {
             latest_send,
             deadline,
             reply,
+            // Called from the handler, inside the call's trace span.
+            span: Span::current(),
         };
         let member = match self.submit_in_process(member, now) {
             InProcess::Done(result) => return result,
@@ -153,6 +159,7 @@ impl Coalescer {
                 && batch.send_at <= member.latest_send
                 && members.fits(&member.request, &self.limits)
             {
+                telemetry::link_to_batch(&batch.span, &member.span);
                 members.add(member);
                 return None;
             }
@@ -170,12 +177,19 @@ impl Coalescer {
     ) {
         let mut members = Members::new(member.request.state_tokens);
         let key = member.request.key;
+        // The first call is the batch's parent (see `telemetry`).
+        let span = telemetry::batch(
+            &member.span,
+            self.dispatcher.backend(),
+            &member.request.model,
+        );
         members.add(member);
         let batch = Arc::new(Batch {
             key,
             opened: now,
             send_at: slot.max(now + self.limits.window),
             members: Mutex::new(members),
+            span,
         });
         if !self.limits.window.is_zero() {
             // A newer batch replaces a full one for the same key; the full
@@ -226,7 +240,9 @@ impl Coalescer {
             members.sealed = true;
             std::mem::take(&mut members.calls)
         };
-        self.dispatcher.dispatch(calls, permit, batch.opened).await;
+        self.dispatcher
+            .dispatch(calls, permit, batch.opened, batch.span.clone())
+            .await;
     }
 
     /// Answers 429 to the callers of `batch` whose latest send time has
@@ -312,6 +328,7 @@ mod tests {
             latest_send: now + Duration::from_secs(1),
             deadline: now + Duration::from_secs(2),
             reply,
+            span: Span::none(),
         };
         (member, answer)
     }
