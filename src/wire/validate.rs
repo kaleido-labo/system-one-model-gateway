@@ -6,7 +6,7 @@
 //! the caller that made it. The checks stop at what the API reference states
 //! (https://docs.typesafe.ai/api.md): anything stricter would turn away
 //! requests the vendor accepts. What slips through is handled by replaying a
-//! rejected merged call one caller at a time (see `dispatch`).
+//! rejected merged call one caller at a time (see `scheduling::dispatch`).
 
 use indexmap::IndexMap;
 use serde_json::value::RawValue;

@@ -83,7 +83,7 @@ pub struct CoalescingConfig {
     /// below the vendor's 64k and 32k because the estimate is approximate.
     pub max_request_tokens: u32,
     pub max_state_plus_question_tokens: u32,
-    /// Bytes of minified JSON counted as one token (see `tokens`).
+    /// Bytes of minified JSON counted as one token (see `wire::tokens`).
     pub bytes_per_token: f64,
 }
 
