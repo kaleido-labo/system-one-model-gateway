@@ -38,6 +38,7 @@ Environment variables the gateway reads:
 [server]          # listeners, timeouts, logging
 [[backend]]       # one block per model provider; repeat as needed
 [coalescing]      # merging of calls that share a state
+[cache]           # optional answer cache, off by default
 [[service]]       # one block per calling service; at least one is required
 ```
 
@@ -96,6 +97,12 @@ or a sub-table (`[backend.request_extras]`) placed right after its backend.
 | --- | --- | --- | --- |
 | `models_cache_ttl_ms` | integer | `300000` | How long the backend's own `GET /v1/models` answer is kept in memory. A chat backend ignores it, because it lists the exact names in `models` without calling upstream. |
 
+### Answer cache
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `cache` | boolean | `true` | Lets the [answer cache](#cache) keep and serve this backend's answers. It does nothing while `[cache] enabled` is `false`. Set it to `false` for a backend whose answers should differ from one call to the next, such as a chat model sampled at a temperature above zero (`request_extras = { temperature = 0.7 }`). |
+
 ### Limits and pacing
 
 These limits describe the backend and are shared by every service. They are
@@ -141,6 +148,26 @@ These settings apply to every backend. `max_request_tokens` and
 sends one request per question, but it still forms batches under the same
 limits, so they cap the size of a batch there too.
 
+## `[cache]`
+
+An in-memory cache of answers, off by default. It is one table for the whole
+gateway, not one per backend, because the memory bound and the time to live are
+what an operator reasons about for the process. A backend that must not be
+cached opts out with `cache = false` in its own block.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `false` | Turns the cache on. Cached answers trade freshness for fewer upstream requests, so the operator chooses that. |
+| `ttl_ms` | integer, > 0 | `300000` | How long an answer may be served after the backend gave it. A read does not extend it. |
+| `max_entries` | integer, > 0 | `10000` | Most answers held at once, one per question. When the cache is full, the oldest answer makes room. |
+
+An answer is kept per question, under the model, the state, the extra top-level
+fields and the question itself, so it is only served for exactly the same call.
+Answers are small (a few hundred bytes), so the default bound is a few
+megabytes. The cache lives in the process: a restart empties it, and with
+several replicas each one has its own. See [Architecture](architecture.md#answer-cache)
+for how a call uses it and [Operations](operations.md#metrics) for what to watch.
+
 ## `[[service]]`
 
 One block per calling service. At least one is required.
@@ -169,7 +196,8 @@ it is later refused upstream.
 - `upstream_model` or `request_extras` is set on a `systemone` backend;
 - a model pattern is empty or has a `*` anywhere but the end;
 - two backends list the same model entry;
-- a rate, a timeout or a size that must be positive is zero;
+- a rate, a timeout or a size that must be positive is zero, `cache.ttl_ms` and
+  `cache.max_entries` included;
 - a backend's `max_queue_wait_ms` is not smaller than `server.request_timeout_ms`;
 - a service has no `key_sha256`, a hash that is not 64 hexadecimal characters,
   or a hash shared with another service;

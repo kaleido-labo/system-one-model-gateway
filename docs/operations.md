@@ -100,7 +100,7 @@ Every name starts with `systemone_gateway_`.
 | --- | --- | --- | --- |
 | `calls_total` | counter | `service`, `status` | Calls received, by response status. A call refused before authentication has `service="-"`. A body refused for its size (413) is not counted. |
 | `call_duration_seconds` | histogram | `service` | Time from receiving a call to answering it, queueing included. |
-| `questions_total` | counter | `service` | Questions asked. Counted once a call has been accepted for batching: calls refused earlier (validation, 403, service limits, a booked-out backend) add nothing. |
+| `questions_total` | counter | `service` | Questions asked. Counted once a call has been accepted for batching or answered from the answer cache: calls refused earlier (validation, 403, service limits, a booked-out backend) add nothing. Cached questions count like any other. |
 | `input_tokens_total` | counter | `service`, `backend` | Input tokens charged to each service. Merged calls are split between their callers, and the shares add up to the backend's bill. |
 
 ### Per upstream call (backend side)
@@ -125,6 +125,22 @@ Every name starts with `systemone_gateway_`.
 The three merging histograms have no `backend` label: they aggregate all
 backends.
 
+### Answer cache
+
+`cache_entries` is always exported, at 0 while the cache is off. The two
+counters appear once the cache has looked a question up.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `cache_hits_total` | counter | `backend` | Questions answered from the cache. Counted per question, so a call with 3 cached questions adds 3. |
+| `cache_misses_total` | counter | `backend` | Questions looked up and not found, or found expired. Counted per question. A call sent with `cache-control: no-cache` looks nothing up, so it counts as neither. |
+| `cache_entries` | gauge | | Answers held now. Expired ones are included until a lookup or a write drops them, so it can sit above the live count on a quiet gateway; it never exceeds `max_entries`. |
+
+A call answered from the cache is still a call: it shows up in `calls_total`,
+`call_duration_seconds` and `questions_total` of its service. It adds nothing to
+`input_tokens_total`, `upstream_calls_total` or the merging metrics, because
+nothing went upstream.
+
 ### Useful queries
 
 ```promql
@@ -144,6 +160,11 @@ histogram_quantile(0.95, sum by (le) (rate(systemone_gateway_queue_wait_seconds_
 
 # Input tokens per service
 sum by (service, backend) (rate(systemone_gateway_input_tokens_total[1h]))
+
+# Share of questions answered from the cache, per backend
+sum by (backend) (rate(systemone_gateway_cache_hits_total[5m]))
+  / (sum by (backend) (rate(systemone_gateway_cache_hits_total[5m]))
+     + sum by (backend) (rate(systemone_gateway_cache_misses_total[5m])))
 ```
 
 ## Tuning
@@ -175,6 +196,21 @@ instead of a request slot.
   provider's limits. If TypeSafe rejects large merged calls as too big, lower
   those two, or lower `bytes_per_token` so that the gateway counts more tokens
   per byte.
+
+**Answer cache.** Turn it on when `cache_misses_total` shows services asking
+the same questions about the same states more than once, a moment apart, which
+merging cannot help with because the calls are not in flight together.
+
+- `ttl_ms` is how stale an answer may be. A model behind an alias such as
+  `jev-latest` can change under a cached answer, so keep it short enough that
+  you accept that; callers that must have a fresh answer send
+  `cache-control: no-cache`.
+- If `cache_entries` sits at `max_entries`, the oldest answers are pushed out
+  before they expire: raise `max_entries` if the hit ratio is lower than the
+  repetition you expect. An answer takes a few hundred bytes.
+- Give a backend `cache = false` when its answers should differ between calls.
+- Each replica has its own cache, so the hit ratio falls as replicas are added,
+  like merging.
 
 **Per-service quotas.** Set `requests_per_minute` and `max_concurrent` on each
 service so that one noisy service cannot use up the shared budget. The sum of
@@ -225,7 +261,13 @@ SDK timeout (10 s by default, in the caller)
 - **Provider limits move.** TypeSafe's limits change without notice
   ([models](https://docs.typesafe.ai/models.md)), and the gateway does not learn
   them.
-- **No answer cache.** Two identical calls a minute apart cost two upstream
-  requests. Only calls that are in the gateway at the same time share one.
+- **The answer cache is opt-in and per process.** With `[cache]` off, which is
+  the default, two identical calls a minute apart cost two upstream requests,
+  and only calls in the gateway at the same time share one. With it on, answers
+  are served for up to `ttl_ms` (so a model alias that moves is seen late),
+  a restart or another replica starts with an empty cache, and two identical
+  calls in flight together both go upstream unless they merge into one batch.
+  A call that timed out does not fill the cache, even if the backend answered it
+  afterwards.
 - **No TLS and no admin authentication.** Put the gateway behind a proxy or
   mesh that terminates TLS, and keep the admin port private.
