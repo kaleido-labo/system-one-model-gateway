@@ -20,7 +20,7 @@ use tokio::time::{Instant, sleep_until};
 
 use crate::dispatch::{Dispatcher, MIN_RETRY_AFTER, Member, Outcome};
 use crate::error::GatewayError;
-use crate::protocol::{BatchKey, PreparedRequest, QuestionKey};
+use crate::wire::{BatchKey, PreparedRequest, QuestionKey};
 
 /// What one merged upstream call may carry.
 #[derive(Debug, Clone)]
@@ -290,8 +290,8 @@ mod tests {
     use crate::backend::Engine;
     use crate::limiter::Gcra;
     use crate::metrics::Metrics;
-    use crate::tokens::TokenEstimator;
     use crate::upstream::{ApiKey, RetryPolicy, Upstream};
+    use crate::wire::TokenEstimator;
     use serde_json::json;
 
     fn request(state: &str, questions: serde_json::Value) -> PreparedRequest {

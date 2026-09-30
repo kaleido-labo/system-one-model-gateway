@@ -14,9 +14,9 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 
-use crate::json::{JsonKind, ObjectWriter, minify};
-use crate::tokens::TokenEstimator;
-use crate::validate::{Invalid, check_question};
+use crate::wire::json::{JsonKind, ObjectWriter, minify};
+use crate::wire::tokens::TokenEstimator;
+use crate::wire::validate::{Invalid, check_question};
 
 /// Requests with the same key carry the same `model`, the same `state` and
 /// the same other top-level fields, so their questions can share one call.

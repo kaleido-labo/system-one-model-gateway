@@ -17,16 +17,13 @@ mod coalescer;
 mod config;
 mod dispatch;
 mod error;
-mod json;
 mod limiter;
 mod metrics;
 mod pattern;
-mod protocol;
 mod services;
-mod tokens;
 mod upstream;
 mod usage;
-mod validate;
+mod wire;
 
 pub use app::Gateway;
 pub use config::{Config, LogFormat, Protocol};

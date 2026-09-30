@@ -10,9 +10,8 @@ use bytes::Bytes;
 use indexmap::IndexMap;
 use serde_json::value::RawValue;
 
-use crate::json::ObjectWriter;
-use crate::protocol::{PreparedRequest, QuestionKey, UpstreamAnswers, input_tokens};
 use crate::usage::apportion;
+use crate::wire::{ObjectWriter, PreparedRequest, QuestionKey, UpstreamAnswers, input_tokens};
 
 /// How a batch of calls goes upstream, and how the answer comes back.
 #[derive(Debug)]
@@ -246,7 +245,7 @@ impl Plan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tokens::TokenEstimator;
+    use crate::wire::TokenEstimator;
     use serde_json::{Value, json};
 
     /// A request whose questions keep the given order. `json!` would sort

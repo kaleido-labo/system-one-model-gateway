@@ -27,11 +27,9 @@ use crate::coalescer::Saturated;
 use crate::dispatch::Outcome;
 use crate::error::{GatewayError, insert_retry_after};
 use crate::metrics::{CallLabels, Metrics};
-use crate::protocol::{PreparedRequest, RequestError};
 use crate::services::{Refusal, ServiceId, ServiceRegistry};
-use crate::tokens::TokenEstimator;
 use crate::upstream::REQUEST_ID;
-use crate::validate::Invalid;
+use crate::wire::{Invalid, PreparedRequest, RequestError, TokenEstimator};
 
 /// How many calls shared the upstream call that answered this one.
 pub const BATCH_CALLERS: HeaderName = HeaderName::from_static("x-systemone-gateway-batch-callers");
@@ -294,7 +292,7 @@ async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
         list.push_str(entry.get());
     }
     list.push(']');
-    let mut body = crate::json::ObjectWriter::with_capacity(list.len() + 12);
+    let mut body = crate::wire::ObjectWriter::with_capacity(list.len() + 12);
     body.field("models", &list);
     (StatusCode::OK, json_headers(None), body.finish()).into_response()
 }

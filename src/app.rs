@@ -15,7 +15,7 @@ use crate::backend::Backends;
 use crate::config::{Config, millis};
 use crate::metrics::Metrics;
 use crate::services::ServiceRegistry;
-use crate::tokens::TokenEstimator;
+use crate::wire::TokenEstimator;
 
 /// Both servers, listening.
 pub struct Gateway {

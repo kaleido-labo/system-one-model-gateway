@@ -22,9 +22,8 @@ use crate::error::GatewayError;
 use crate::limiter::Gcra;
 use crate::metrics::Metrics;
 use crate::pattern::{ModelPattern, best_match, parse_all};
-use crate::protocol::PreparedRequest;
 use crate::upstream::{ApiKey, RetryPolicy, Upstream, UpstreamFailure, UpstreamReply};
-use crate::validate::Invalid;
+use crate::wire::{Invalid, PreparedRequest};
 
 /// How a backend answers a System One request.
 pub enum Engine {

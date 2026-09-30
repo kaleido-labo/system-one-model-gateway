@@ -12,7 +12,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 
-use crate::validate::Invalid;
+use crate::wire::Invalid;
 
 /// `retry-after-ms`, which the TypeSafe SDKs read before `retry-after`.
 pub const RETRY_AFTER_MS: HeaderName = HeaderName::from_static("retry-after-ms");

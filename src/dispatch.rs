@@ -16,8 +16,8 @@ use crate::batch::{Plan, SplitError};
 use crate::error::GatewayError;
 use crate::limiter::Gcra;
 use crate::metrics::Metrics;
-use crate::protocol::{PreparedRequest, input_tokens};
 use crate::upstream::{UpstreamFailure, describe};
+use crate::wire::{PreparedRequest, input_tokens};
 
 /// Shortest retry-after the gateway suggests when it sheds a call.
 pub const MIN_RETRY_AFTER: Duration = Duration::from_millis(500);

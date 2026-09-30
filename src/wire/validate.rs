@@ -11,7 +11,7 @@
 use indexmap::IndexMap;
 use serde_json::value::RawValue;
 
-use crate::json::JsonKind;
+use crate::wire::json::JsonKind;
 
 /// Most options a Choice question accepts.
 pub const MAX_CHOICE_OPTIONS: usize = 255;

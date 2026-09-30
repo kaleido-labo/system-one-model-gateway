@@ -31,10 +31,8 @@ use serde_json::{Map, Value, json};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep_until};
 
-use crate::json::{ObjectWriter, minify};
-use crate::protocol::PreparedRequest;
 use crate::upstream::{Upstream, UpstreamFailure, UpstreamReply};
-use crate::validate::Invalid;
+use crate::wire::{Invalid, ObjectWriter, PreparedRequest, minify};
 
 /// Most options a Choice question may have on a chat backend: one letter each.
 pub const MAX_CHOICE_OPTIONS: usize = 26;
