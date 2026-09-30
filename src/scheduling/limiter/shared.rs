@@ -320,6 +320,11 @@ impl Limiters {
             !url.is_empty(),
             "cluster: the Redis URL must be in the {variable} environment variable"
         );
+        anyhow::ensure!(
+            !url.starts_with("rediss://"),
+            "cluster: {variable} is a rediss:// URL, but the gateway connects to Redis without \
+             TLS; use a redis:// URL on a private network"
+        );
         // The URL can hold a password: the errors below never repeat it.
         let client = redis::Client::open(url).map_err(|_| {
             anyhow::anyhow!(
@@ -450,6 +455,15 @@ mod tests {
             .err()
             .unwrap();
         assert!(err.to_string().contains("REDIS_URL"), "{err}");
+
+        let err = Limiters::from_config(
+            Some(&config),
+            &|_| Some("rediss://redis.example:6380".to_owned()),
+            &Metrics::new(),
+        )
+        .err()
+        .unwrap();
+        assert!(err.to_string().contains("TLS"), "{err}");
 
         let password = "hunter2-the-password";
         let err = Limiters::from_config(

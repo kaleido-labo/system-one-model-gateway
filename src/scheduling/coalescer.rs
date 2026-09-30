@@ -114,9 +114,8 @@ impl Coalescer {
         // Lock order: the open map, then a batch's members, then the pacer.
         // `run` and `shed_expired` take them in the same order.
         let open = lock(&self.open);
-        let member = match self.join(&open, member) {
-            Ok(()) => return InProcess::Done(Ok(())),
-            Err(member) => member,
+        let Some(member) = self.join(&open, member) else {
+            return InProcess::Done(Ok(()));
         };
 
         // A new batch needs its own upstream slot, early enough for this call.
@@ -137,8 +136,8 @@ impl Coalescer {
     fn join_or_open(self: &Arc<Self>, member: Member, slot: Instant, now: Instant) -> bool {
         let open = lock(&self.open);
         match self.join(&open, member) {
-            Ok(()) => true,
-            Err(member) => {
+            None => true,
+            Some(member) => {
                 self.open_batch(open, member, slot, now);
                 false
             }
@@ -147,7 +146,7 @@ impl Coalescer {
 
     /// Adds the call to the open batch for its state, if that batch can
     /// still take it. Otherwise hands the call back.
-    fn join(&self, open: &HashMap<BatchKey, Arc<Batch>>, member: Member) -> Result<(), Member> {
+    fn join(&self, open: &HashMap<BatchKey, Arc<Batch>>, member: Member) -> Option<Member> {
         if let Some(batch) = open.get(&member.request.key) {
             let mut members = lock(&batch.members);
             if !members.sealed
@@ -155,10 +154,10 @@ impl Coalescer {
                 && members.fits(&member.request, &self.limits)
             {
                 members.add(member);
-                return Ok(());
+                return None;
             }
         }
-        Err(member)
+        Some(member)
     }
 
     /// Opens a batch for the call, to leave when `slot` is reached.
