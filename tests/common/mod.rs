@@ -30,6 +30,9 @@ pub struct Setup {
     pub services: Vec<(&'static str, &'static str, &'static str)>,
     /// The key the gateway presents to the mock, on both backends.
     pub gateway_key: &'static str,
+    /// The admin token, handed to the gateway through `server.admin_token_env`.
+    /// `None` leaves the admin port open.
+    pub admin_token: Option<&'static str>,
 }
 
 impl Default for Setup {
@@ -46,6 +49,7 @@ impl Default for Setup {
                 ("triage", "key-triage", ""),
             ],
             gateway_key: UPSTREAM_KEY,
+            admin_token: None,
         }
     }
 }
@@ -77,8 +81,13 @@ impl Reply {
 impl Harness {
     pub async fn start(setup: Setup) -> Self {
         let mock = MockUpstream::start("127.0.0.1:0".parse().unwrap(), UPSTREAM_KEY).await;
+        let admin_token_env = if setup.admin_token.is_some() {
+            "admin_token_env = \"MOCK_ADMIN_TOKEN\"\n"
+        } else {
+            ""
+        };
         let mut toml = format!(
-            "[server]\nlisten = \"127.0.0.1:0\"\nadmin_listen = \"127.0.0.1:0\"\n{}\n\
+            "[server]\nlisten = \"127.0.0.1:0\"\nadmin_listen = \"127.0.0.1:0\"\n{admin_token_env}{}\n\
              [[backend]]\nname = \"typesafe\"\nbase_url = \"{}\"\napi_key_env = \"MOCK_KEY\"\n\
              models = [\"jev-*\"]\nbackoff_initial_ms = 20\nbackoff_max_ms = 100\n{}\n",
             setup.server, mock.url, setup.upstream
@@ -101,8 +110,11 @@ impl Harness {
         }
         let config = Config::from_toml(&toml).expect("the test configuration is valid");
         let key = setup.gateway_key;
-        let gateway = Gateway::start(&config, move |variable| {
-            (variable == "MOCK_KEY").then(|| key.to_owned())
+        let admin_token = setup.admin_token;
+        let gateway = Gateway::start(&config, move |variable| match variable {
+            "MOCK_KEY" => Some(key.to_owned()),
+            "MOCK_ADMIN_TOKEN" => admin_token.map(str::to_owned),
+            _ => None,
         })
         .await
         .unwrap();
@@ -154,6 +166,22 @@ impl Harness {
             .send()
             .await
             .unwrap();
+        (response.status(), response.text().await.unwrap())
+    }
+
+    /// An admin request with the given `Authorization` header value, if any.
+    pub async fn admin_with(
+        &self,
+        path: &str,
+        authorization: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut request = self
+            .client
+            .get(format!("http://{}{path}", self.gateway.admin_addr));
+        if let Some(value) = authorization {
+            request = request.header("authorization", value);
+        }
+        let response = request.send().await.unwrap();
         (response.status(), response.text().await.unwrap())
     }
 

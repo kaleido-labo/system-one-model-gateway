@@ -61,6 +61,14 @@ impl GatewayError {
         )
     }
 
+    pub fn admin_unauthorized() -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "missing or wrong admin token; send it as `Authorization: Bearer <token>`",
+        )
+    }
+
     pub fn model_not_allowed(model: &str) -> Self {
         Self {
             param: Some("model".to_owned()),

@@ -43,6 +43,10 @@ pub struct ServerConfig {
     pub listen: SocketAddr,
     /// Health checks and Prometheus metrics, kept off the public port.
     pub admin_listen: SocketAddr,
+    /// Name of the environment variable that holds a bearer token for
+    /// `/metrics`. Unset leaves the admin port open. `/healthz` and `/readyz`
+    /// never ask for it, because Kubernetes probes cannot easily send a header.
+    pub admin_token_env: Option<String>,
     /// Longest a call may take end to end, queueing included. The TypeSafe
     /// SDKs give up after 10 s by default, so this stays under that: a caller
     /// then gets the gateway's own 504 rather than a client-side timeout that
@@ -57,6 +61,7 @@ impl Default for ServerConfig {
         Self {
             listen: SocketAddr::from(([0, 0, 0, 0], 8080)),
             admin_listen: SocketAddr::from(([0, 0, 0, 0], 9090)),
+            admin_token_env: None,
             request_timeout_ms: 9_000,
             max_body_bytes: 2 * 1024 * 1024,
             log_format: LogFormat::Text,
@@ -160,6 +165,12 @@ impl Config {
             server.max_body_bytes > 0,
             "server.max_body_bytes must be positive"
         );
+        if let Some(variable) = &server.admin_token_env {
+            ensure!(
+                !variable.is_empty(),
+                "server.admin_token_env must name a variable, or be left out for an open admin port"
+            );
+        }
 
         ensure!(
             self.upstream.is_none(),
@@ -365,6 +376,29 @@ mod tests {
 
         let zero_rate = with_service("requests_per_minute = 0");
         assert!(Config::from_toml(&zero_rate).is_err());
+
+        let empty_token_env = format!("[server]\nadmin_token_env = \"\"\n{}", with_service(""));
+        assert!(
+            Config::from_toml(&empty_token_env)
+                .unwrap_err()
+                .to_string()
+                .contains("admin_token_env")
+        );
+    }
+
+    #[test]
+    fn the_admin_token_variable_is_optional() {
+        let open = Config::from_toml(&with_service("")).unwrap();
+        assert_eq!(open.server.admin_token_env, None);
+        let closed = Config::from_toml(&format!(
+            "[server]\nadmin_token_env = \"ADMIN_TOKEN\"\n{}",
+            with_service("")
+        ))
+        .unwrap();
+        assert_eq!(
+            closed.server.admin_token_env.as_deref(),
+            Some("ADMIN_TOKEN")
+        );
     }
 
     fn error_of(toml: &str) -> String {

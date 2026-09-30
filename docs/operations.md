@@ -26,26 +26,33 @@ docker run -p 8080:8080 -p 9090:9090 \
   `/etc/systemone-gateway/gateway.toml` (set by `SYSTEMONE_GATEWAY_CONFIG`).
   Mount your file there.
 - Pass each backend's key as the environment variable named by its
-  `api_key_env`. The gateway refuses to start when one is missing.
+  `api_key_env`, and the admin token as the one named by
+  `server.admin_token_env` if you configure it. The gateway refuses to start
+  when one is missing.
 - The image exposes 8080 (API) and 9090 (health and metrics). To run another
   command, such as `check-config`, put it after the image name:
   `docker run --rm -v ... systemone-gateway check-config`.
-- The gateway serves plain HTTP and its admin port has no authentication.
-  Terminate TLS in front of the public port, and keep port 9090 off the public
-  network.
+- The gateway serves plain HTTP. Terminate TLS in front of the public port,
+  and keep port 9090 off the public network. Its `/metrics` is open unless you
+  configure `server.admin_token_env`, and `/healthz` and `/readyz` are always
+  open.
 
 ## Kubernetes
 
 - Put the configuration in a ConfigMap mounted at
   `/etc/systemone-gateway/gateway.toml`. It holds no secret.
 - Put each backend's key in a Secret and expose it as the environment variable
-  that `api_key_env` names.
+  that `api_key_env` names. Do the same for the admin token, if you configure
+  `server.admin_token_env`.
 - Point the liveness probe at `GET /healthz` and the readiness probe at
   `GET /readyz`, both on port 9090.
 - On SIGTERM the gateway stops accepting connections and lets in-flight calls
   finish. Set `terminationGracePeriodSeconds` a few seconds above
   `server.request_timeout_ms`.
-- Scrape `GET /metrics` on port 9090.
+- Scrape `GET /metrics` on port 9090. With `server.admin_token_env` configured,
+  `/metrics` needs `Authorization: Bearer <token>`: give the scraper the same
+  token, as in the Prometheus example below. The probes need no header, because
+  `/healthz` and `/readyz` stay open even then.
 
 ```yaml
 livenessProbe:
@@ -53,6 +60,22 @@ livenessProbe:
 readinessProbe:
   httpGet: { path: /readyz, port: 9090 }
 ```
+
+A Prometheus scrape job for a gateway with an admin token. The token sits in a
+file that Prometheus can read, mounted from the same Kubernetes Secret:
+
+```yaml
+scrape_configs:
+  - job_name: systemone-gateway
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/gateway-admin-token
+    static_configs:
+      - targets: ["systemone-gateway:9090"]
+```
+
+Leave `authorization` out when the gateway has no admin token.
 
 Pacing, quotas and merging live in memory, so they apply per process. With N
 replicas, give each replica 1/N of each backend's `requests_per_minute` and
@@ -231,5 +254,7 @@ SDK timeout (10 s by default, in the caller)
   them.
 - **No answer cache.** Two identical calls a minute apart cost two upstream
   requests. Only calls that are in the gateway at the same time share one.
-- **No TLS and no admin authentication.** Put the gateway behind a proxy or
-  mesh that terminates TLS, and keep the admin port private.
+- **No TLS, and only a light guard on the admin port.** Put the gateway behind
+  a proxy or mesh that terminates TLS, and keep the admin port private. The
+  optional `server.admin_token_env` protects `/metrics` and nothing else: the
+  probes stay open, and without TLS the token travels in clear text.

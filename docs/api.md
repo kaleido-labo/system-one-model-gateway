@@ -22,8 +22,8 @@ Authorization: Bearer s1gw_...
 
 The scheme name is case-insensitive. The gateway hashes the key and looks the
 hash up among the `key_sha256` values of the configuration, so a missing or
-unknown key gets a 401 and never reaches a backend. The admin port has no
-authentication.
+unknown key gets a 401 and never reaches a backend. The admin port has its own,
+optional token, see [Admin endpoints](#admin-endpoints).
 
 The TypeSafe Python SDK reads `TYPESAFE_BASE_URL` and `TYPESAFE_API_KEY`, so
 pointing a service at the gateway is a matter of setting both. For another SDK,
@@ -134,7 +134,13 @@ Listing a model does not mean a service may use it: a service's
 | --- | --- |
 | `GET /healthz` | `200 ok` while the process runs. |
 | `GET /readyz` | `200 ready` once both listeners are up; `503 shutting down` once shutdown has started. The admin server stops accepting connections at the same time, so a new probe may get a refused connection instead. |
-| `GET /metrics` | Prometheus metrics in OpenMetrics text, see [Operations](operations.md#metrics). |
+| `GET /metrics` | Prometheus metrics in OpenMetrics text, see [Operations](operations.md#metrics). Needs `Authorization: Bearer <token>` when `server.admin_token_env` is configured; a missing or wrong token gets a 401 in the [error shape](#errors) below. |
+
+The admin port is open unless `server.admin_token_env` names an environment
+variable that holds a token. The token protects `/metrics` only. `/healthz` and
+`/readyz` stay open in every case, because Kubernetes probes cannot easily send
+a header, and what they answer is nothing you need to hide. The token is
+compared in constant time, and the scheme name is case-insensitive.
 
 ## Errors
 
@@ -152,7 +158,7 @@ against TypeSafe, and retry the same statuses (429 and 5xx) while honouring
 | Status | `type` | When |
 | --- | --- | --- |
 | 400 | `invalid_request_error` | The body is not a JSON object. |
-| 401 | `authentication_error` | Missing, malformed or unknown service key. |
+| 401 | `authentication_error` | Missing, malformed or unknown service key. On the admin port: a missing or wrong token for `/metrics`. |
 | 403 | `permission_error` | The model is not in the service's `allowed_models`. `param` is `model`. |
 | 404 | `not_found_error` | No such route on the public port. |
 | 422 | `validation_error` | A documented rule is broken, no backend serves the model, or a chat backend cannot express the question (more than 26 options). `param` names the field. |

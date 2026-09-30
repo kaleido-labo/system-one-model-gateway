@@ -31,8 +31,11 @@ use crate::scheduling::Outcome;
 use crate::services::ServiceRegistry;
 use crate::wire::TokenEstimator;
 
+mod admin;
 mod models;
 mod systemone;
+
+pub use admin::AdminToken;
 
 /// How many calls shared the upstream call that answered this one.
 pub const BATCH_CALLERS: HeaderName = HeaderName::from_static("x-systemone-gateway-batch-callers");
@@ -48,6 +51,8 @@ pub struct Shared {
     pub metrics: Arc<Metrics>,
     pub estimator: TokenEstimator,
     pub request_timeout: Duration,
+    /// Set when `server.admin_token_env` is: `/metrics` then needs it.
+    pub admin_token: Option<AdminToken>,
     pub ready: AtomicBool,
 }
 
@@ -162,7 +167,12 @@ async fn readyz(State(state): State<AppState>) -> Response {
     }
 }
 
-async fn metrics(State(state): State<AppState>) -> Response {
+async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(token) = &state.0.admin_token
+        && !token.allows(&headers)
+    {
+        return GatewayError::admin_unauthorized().into_response();
+    }
     (
         [(
             CONTENT_TYPE,

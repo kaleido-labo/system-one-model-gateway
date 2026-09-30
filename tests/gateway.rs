@@ -516,6 +516,60 @@ async fn health_readiness_and_unknown_routes() {
 }
 
 #[tokio::test]
+async fn an_admin_token_protects_metrics_only() {
+    let h = Harness::start(Setup {
+        admin_token: Some("scrape-secret"),
+        ..Setup::default()
+    })
+    .await;
+
+    // The probes stay open: a Kubernetes probe cannot easily send a header.
+    assert_eq!(
+        h.admin("/healthz").await,
+        (reqwest::StatusCode::OK, "ok".to_owned())
+    );
+    assert_eq!(
+        h.admin("/readyz").await,
+        (reqwest::StatusCode::OK, "ready".to_owned())
+    );
+
+    for authorization in [
+        None,
+        Some("Bearer wrong-token"),
+        Some("Bearer scrape-secret-and-more"),
+        Some("Basic scrape-secret"),
+        Some("scrape-secret"),
+    ] {
+        let (status, text) = h.admin_with("/metrics", authorization).await;
+        assert_eq!(status, 401, "{authorization:?}: {text}");
+        let body: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["error"]["type"], "authentication_error");
+        assert!(!text.contains("scrape-secret"), "{text}");
+    }
+
+    let (status, metrics) = h.admin_with("/metrics", Some("Bearer scrape-secret")).await;
+    assert_eq!(status, 200);
+    assert!(metrics.ends_with("# EOF\n"));
+    let (status, _) = h.admin_with("/metrics", Some("bearer scrape-secret")).await;
+    assert_eq!(status, 200, "the scheme name is case-insensitive");
+
+    // The token does not open or close anything on the public port.
+    let reply = h
+        .call("key-ocr", call_body(document(), json!({"q": noul("A?")})))
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.text);
+}
+
+#[tokio::test]
+async fn without_an_admin_token_the_admin_port_is_open() {
+    let h = Harness::start(Setup::default()).await;
+    for authorization in [None, Some("Bearer anything")] {
+        let (status, _) = h.admin_with("/metrics", authorization).await;
+        assert_eq!(status, 200, "{authorization:?}");
+    }
+}
+
+#[tokio::test]
 async fn shutdown_lets_in_flight_calls_finish() {
     let h = Harness::start(Setup::default()).await;
     h.mock.state.set_delay(Duration::from_millis(300));
