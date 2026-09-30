@@ -1,5 +1,7 @@
 //! Prometheus metrics, served in OpenMetrics text on the admin port.
 
+use std::sync::atomic::AtomicU64;
+
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;
@@ -57,6 +59,8 @@ pub struct Metrics {
     pub upstream_duration: HistogramFamily<BackendLabels>,
     pub upstream_retries: Family<BackendLabels, Counter>,
     pub circuit_state: Family<BackendLabels, Gauge>,
+    pub requests_per_minute_limit: Family<BackendLabels, Gauge<f64, AtomicU64>>,
+    pub rate_decreases: Family<BackendLabels, Counter>,
     pub fallback_calls: Family<FallbackLabels, Counter>,
     pub batch_callers: HistogramFamily<BackendLabels>,
     pub batch_questions: HistogramFamily<BackendLabels>,
@@ -136,6 +140,18 @@ impl Metrics {
             "circuit_state",
             "Circuit breaker of each backend: 0 closed, 1 half-open (one trial call allowed), 2 open (calls turned away)",
             circuit_state.clone(),
+        );
+        let requests_per_minute_limit = Family::<BackendLabels, Gauge<f64, AtomicU64>>::default();
+        registry.register(
+            "requests_per_minute_limit",
+            "Requests per minute the gateway paces each backend at now: its requests_per_minute, or the rate it adapted to when adaptive_rate is on",
+            requests_per_minute_limit.clone(),
+        );
+        let rate_decreases = Family::<BackendLabels, Counter>::default();
+        registry.register(
+            "rate_decreases",
+            "Times the adaptive rate lowered a backend's request rate after a 429; one per episode of 429s",
+            rate_decreases.clone(),
         );
         let fallback_calls = Family::<FallbackLabels, Counter>::default();
         registry.register(
@@ -217,6 +233,8 @@ impl Metrics {
             upstream_duration,
             upstream_retries,
             circuit_state,
+            requests_per_minute_limit,
+            rate_decreases,
             fallback_calls,
             batch_callers,
             batch_questions,
@@ -292,7 +310,23 @@ mod tests {
             .isolated_replays
             .get_or_create(&Metrics::backend("hf"))
             .inc();
+        metrics
+            .requests_per_minute_limit
+            .get_or_create(&Metrics::backend("hf"))
+            .set(840.0);
+        metrics
+            .rate_decreases
+            .get_or_create(&Metrics::backend("hf"))
+            .inc();
         let text = metrics.render();
+        assert!(
+            text.contains(r#"systemone_gateway_requests_per_minute_limit{backend="hf"} 840.0"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"systemone_gateway_rate_decreases_total{backend="hf"} 1"#),
+            "{text}"
+        );
         assert!(
             text.contains(r#"systemone_gateway_calls_total{service="ocr",status="200"} 1"#),
             "{text}"

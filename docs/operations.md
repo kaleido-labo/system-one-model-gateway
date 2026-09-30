@@ -159,6 +159,36 @@ Hashing keeps a state on one replica while the set of replicas is stable.
 When replicas come and go, some states move, and a state that is asked about
 very often loads one replica more than the others.
 
+### Adaptive rate and replicas
+
+With [`adaptive_rate`](configuration.md#adaptive-rate), every replica adapts its
+own rate. Redis keeps times, not rates: the script takes the rate on every
+booking, so a replica lowers its rate by booking with a longer spacing, and
+nothing is stored or agreed.
+
+- **The pause is shared, the 429 is not.** After a 429, the pause is in Redis
+  and every replica waits it out. But only the replica that received the 429
+  counts it: the others see a pause and hold, and do not lower their rate. A
+  replica lowers its rate only when a 429 reaches it.
+- **The cluster's pace is a blend.** Each booking moves the shared arrival time
+  by the booking replica's own spacing, so the cluster runs at a rate between
+  the lowest and the highest of the replicas' rates, weighted by how many
+  bookings each makes. When one replica out of three has lowered its rate, the
+  cluster slows by less than that.
+- **It converges, not at once.** If the provider keeps refusing, the replicas
+  that still pace at the ceiling take a 429 of their own within moments of the
+  pause ending, lower their rate, and the blend comes down. The price of not
+  coordinating is a few extra 429s, each retried by the gateway. Replicas also
+  recover on their own clocks, so they climb back out of step and meet at the
+  ceiling. That is acceptable when the replicas carry similar traffic, which is
+  what a load balancer gives you. It is not a guarantee that the cluster
+  is under the provider's new limit after the first episode.
+- **Redis down.** The local share, which holds the limit divided by
+  `expected_replicas`, follows the adapted rate divided the same way.
+- **Read the gauge per replica.** `requests_per_minute_limit` is each
+  replica's own rate, so it differs between replicas exactly when they have
+  not converged: `min by (backend) (...)` is where the cluster is heading.
+
 ## Logs
 
 Logs go to standard output. `server.log_format = "json"` gives one JSON object
@@ -186,6 +216,8 @@ and timings.
 | warn | `circuit breaker opened: the backend failed every call lately` | A backend failed `circuit_breaker_failures` calls in a row. Its calls go to its fallbacks, or get a 503, for `cooldown_ms`. |
 | warn | `circuit breaker opened again: the trial call failed` | The trial call after a cool-down failed. |
 | info | `circuit breaker closed: the trial call was answered` | The backend answered the trial call. |
+| info | `lowered the request rate after a 429; it rises again while the backend stays quiet` | [Adaptive rate](configuration.md#adaptive-rate): a 429 started an episode. With `backend`, `from_rpm`, `to_rpm` and `min_rpm`. One line per decrease, not per 429. |
+| info | `the request rate is back at the configured requests_per_minute` | The adaptive rate has recovered to its ceiling. Each recovery step on the way is logged only at debug (`raised the request rate`). |
 | warn | `the shared rate limiter's Redis does not answer; every replica paces with its own share of the limits until it does` | The first booking of an outage that could not reach Redis, with the `reason`. Logged once per outage, not per call. Only with `[cluster]`. |
 | info | `the shared rate limiter's Redis answers again; pacing is shared again` | The end of that outage. |
 | error | `the backend refused the gateway's API key` | A backend answered 401. Fix the key: every call to that backend fails with a 502 until you do. |
@@ -219,6 +251,13 @@ Every name starts with `systemone_gateway_`.
 | `upstream_calls_total` | counter | `backend`, `status` | HTTP calls to a backend, by final status after retries. `status="0"` means the backend could not be reached. A chat backend makes one call per question. |
 | `upstream_duration_seconds` | histogram | `backend` | Time spent in a backend's HTTP calls, retries included. |
 | `upstream_retries_total` | counter | `backend` | Attempts retried after a 429, 500, 502, 503, 504, 529 or network error. |
+
+### Request rate
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `requests_per_minute_limit` | gauge | `backend` | The requests per minute the gateway paces the backend at now. Exported for every backend from the start: it is `requests_per_minute` and never moves unless `adaptive_rate` is on, and then it follows the adapted rate between the floor and `requests_per_minute`. Per replica. |
+| `rate_decreases_total` | counter | `backend` | Times the adaptive rate lowered the rate: one per episode of 429s, not one per 429. Appears after the first decrease. |
 
 ### Circuit breaker and fallback
 
@@ -282,6 +321,12 @@ sum by (backend) (rate(systemone_gateway_batch_callers_sum[5m]))
 
 # 95th percentile of the time a batch waits before going upstream, per backend
 histogram_quantile(0.95, sum by (backend, le) (rate(systemone_gateway_queue_wait_seconds_bucket[5m])))
+
+# The rate each backend is paced at now, lowest across replicas
+min by (backend) (systemone_gateway_requests_per_minute_limit)
+
+# Episodes of 429s that lowered a rate, per backend
+sum by (backend) (increase(systemone_gateway_rate_decreases_total[1h]))
 
 # Backends with an open breaker
 max by (backend) (systemone_gateway_circuit_state) == 2
@@ -416,8 +461,32 @@ what the account may use, divided by the number of replicas, or undivided when
 the replicas [share their limits through Redis](#sharing-the-limits-between-replicas). The defaults
 (1200 and 250000) are starting points, and a provider can change its limits
 without notice. If `upstream_calls_total{status="429"}` keeps growing, the
-limit is set too high: lower that backend's `requests_per_minute`. The gateway
-backs off on every 429 but does not learn a lower rate by itself.
+limit is set too high: lower that backend's `requests_per_minute`. By default
+the gateway backs off on every 429 but does not learn a lower rate by itself.
+
+**Adaptive rate.** Turn on `adaptive_rate` for a backend whose limit you do not
+control, or that moves: the gateway then lowers its pacing when it is refused,
+and raises it again while it is not. Set `requests_per_minute` to the most the
+account may ever use, because it is the ceiling, and leave the rest at their
+defaults to start.
+
+- Watch `requests_per_minute_limit` and `rate_decreases_total`. A rate that
+  falls and climbs back every few minutes is the gateway finding the provider's
+  limit from above: your ceiling is higher than what the provider allows, and
+  each fall costs a few 429s, which are retried. Lower `requests_per_minute` to
+  that level to stop the probing, or raise `adaptive_recovery_ms` or lower
+  `adaptive_increase_per_minute` to probe less often or less far.
+- `adaptive_decrease` sets how hard a 429 is taken: `0.5` backs off fast, `0.9`
+  gently. `adaptive_recovery_ms` also sets how long 429s count as one episode, so
+  keep it longer than an upstream attempt takes.
+- `adaptive_min_requests_per_minute` is the most useful guard. Set it to the
+  lowest rate you would still want to serve at: below it, callers get 429s
+  from the gateway (`max_queue_wait_ms` runs out) rather than a slower
+  backend.
+- It reacts to 429s only. A backend that slows down without refusing, or
+  answers 5xx when it is overloaded, does not lower the rate; use the circuit
+  breaker for that.
+- With replicas, read [Adaptive rate and replicas](#adaptive-rate-and-replicas).
 
 **Concurrency.** `max_concurrency` bounds the batches in flight to a backend.
 The number you need is about the batches per second times the upstream latency
@@ -520,8 +589,16 @@ SDK timeout (10 s by default, in the caller)
   backend is not calibrated like Jev. See
   [Backends](backends.md#chat-backends-are-not-calibrated-like-jev).
 - **Provider limits move.** TypeSafe's limits change without notice
-  ([models](https://docs.typesafe.ai/models.md)), and the gateway does not learn
-  them.
+  ([models](https://docs.typesafe.ai/models.md)). By default the gateway does
+  not learn them: it backs off on every 429 and keeps pacing at
+  `requests_per_minute`. With `adaptive_rate` it lowers its pacing after a 429
+  and raises it again, but only that. It learns from 429s alone, so a provider
+  that slows down without refusing does not move it, and a limit that is raised
+  is never discovered, because the rate does not go above `requests_per_minute`.
+  The adapted rate lives in memory and starts again from the ceiling after a restart.
+  Replicas adapt on their own 429s and converge over a few episodes (see
+  [Adaptive rate and replicas](#adaptive-rate-and-replicas)). `tokens_per_second`
+  does not adapt.
 - **The answer cache is opt-in and per process.** With `[cache]` off, which is
   the default, two identical calls a minute apart cost two upstream requests,
   and only calls in the gateway at the same time share one. With it on, answers

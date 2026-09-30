@@ -242,7 +242,8 @@ fails for ten services is one failed call.
 
 A 429 never trips the breaker. The backend answered, and the
 [pause after a 429](architecture.md#retries-and-backoff) already holds the
-traffic back. Nor do client errors (400, 403, 422): the call was at fault, not
+traffic back, and with [`adaptive_rate`](configuration.md#adaptive-rate) the
+rate is lowered too. Nor do client errors (400, 403, 422): the call was at fault, not
 the backend. A call that never started (its deadline passed first) or whose
 answer could not be read says nothing either way.
 

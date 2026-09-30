@@ -12,6 +12,7 @@ use bytes::Bytes;
 use tokio::time::{Instant, sleep_until};
 use tracing::{Instrument, Span, warn};
 
+use super::adaptive::RateAdapter;
 use crate::metrics::{Metrics, UpstreamLabels};
 use crate::scheduling::Limiter;
 use crate::telemetry;
@@ -55,6 +56,8 @@ pub struct Upstream {
     retry: RetryPolicy,
     /// The shared request pacer, paused here when the vendor answers 429.
     pacer: Arc<Limiter>,
+    /// Told of every 429, when the backend's rate adapts.
+    rate: Option<Arc<RateAdapter>>,
     metrics: Arc<Metrics>,
 }
 
@@ -86,8 +89,15 @@ impl Upstream {
             api_key,
             retry,
             pacer,
+            rate: None,
             metrics,
         })
+    }
+
+    /// Reports every 429 to `rate`, which lowers the pacer's rate.
+    pub fn with_rate_adapter(mut self, rate: Arc<RateAdapter>) -> Self {
+        self.rate = Some(rate);
+        self
     }
 
     /// The backend's request pacer.
@@ -186,7 +196,12 @@ impl Upstream {
             if let UpstreamFailure::Status { status, .. } = &failure
                 && *status == StatusCode::TOO_MANY_REQUESTS
             {
-                // Everyone is over the vendor's limit, not just this call.
+                // Everyone is over the vendor's limit, not just this call. A
+                // lower rate goes in first: the pause keeps the bookings that
+                // follow it apart at the rate in force when it is set.
+                if let Some(rate) = &self.rate {
+                    rate.on_rate_limited();
+                }
                 self.pacer.pause_until(Instant::now() + delay).await;
             }
             if attempt >= self.retry.max_retries {

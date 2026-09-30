@@ -89,6 +89,26 @@ tokens_per_second = 250000
 # Batches in flight to this backend at the same time.
 max_concurrency = 64
 
+# Adaptive rate, off by default. On, requests_per_minute above becomes a
+# ceiling: a 429 from this backend multiplies the rate by adaptive_decrease,
+# and every adaptive_recovery_ms without a 429 adds adaptive_increase_per_minute
+# back, up to the ceiling. The 429s of one overload lower the rate once: those
+# arriving less than adaptive_recovery_ms after a decrease are the same episode.
+# The rate lives in memory, so a restart begins at the ceiling. With [cluster],
+# each replica adapts its own rate (see docs/operations.md).
+adaptive_rate = false
+# The rate never goes below this, in requests per minute. Defaults to a tenth
+# of requests_per_minute, at least 1.
+# adaptive_min_requests_per_minute = 120
+# What a 429 multiplies the rate by, above 0 and below 1.
+adaptive_decrease = 0.7
+# Requests per minute added back at each recovery step. Defaults to a
+# twentieth of requests_per_minute, at least 1.
+# adaptive_increase_per_minute = 60
+# Time without a 429 before each recovery step, in milliseconds. It is also the
+# length of an episode: keep it longer than an upstream attempt takes.
+adaptive_recovery_ms = 10000
+
 # Time allowed to open a connection, in milliseconds.
 connect_timeout_ms = 2000
 # Time allowed for one attempt, in milliseconds. A retry gets a fresh one.
@@ -156,6 +176,9 @@ requests_per_minute = 300
 # burst = 5
 # tokens_per_second = 250000
 # max_concurrency = 64
+# The adaptive rate works the same on a chat backend, in questions per minute:
+# adaptive_rate = true
+# adaptive_min_requests_per_minute = 30
 # connect_timeout_ms = 2000
 # attempt_timeout_ms = 5000
 # max_retries = 3
