@@ -22,6 +22,14 @@ getrandom = "0.4"
 hex = "0.4"
 httpdate = "1"
 indexmap = { version = "2.14", features = ["serde"] }
+# OpenTelemetry tracing: the crates share the 0.33 line, and
+# tracing-opentelemetry 0.34 is the release built for it. The OTLP
+# exporter speaks HTTP with protobuf over reqwest, which the gateway already
+# uses: no tonic, no gRPC stack.
+opentelemetry = { version = "0.33", default-features = false, features = ["trace", "internal-logs"] }
+opentelemetry-http = "0.33"
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "internal-logs"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "internal-logs"] }
 prometheus-client = "0.25"
 reqwest = "0.13.5"
 serde = { version = "1", features = ["derive"] }
@@ -32,7 +40,9 @@ tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "net", "tim
 toml = "1.1"
 tower-http = { version = "0.7.1", features = ["trace", "request-id", "catch-panic"] }
 tracing = "0.1"
+tracing-opentelemetry = { version = "0.34", default-features = false }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
 
 [dev-dependencies]
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "testing"] }
 tokio = { version = "1.53", features = ["test-util"] }
