@@ -13,8 +13,8 @@ fn noul(instructions: &str) -> Value {
     json!({"type": "noul", "instructions": instructions})
 }
 
-fn receipt() -> Value {
-    json!({"receipt": "TOTAL TTC 42,50 EUR - Peage A7", "merchant": "Vinci Autoroutes"})
+fn document() -> Value {
+    json!({"document": "Order 1042 - refund request, 42.50 EUR", "customer": "Example Shop"})
 }
 
 fn call_body(state: Value, questions: Value) -> Value {
@@ -28,8 +28,8 @@ async fn a_lone_call_is_forwarded_and_answered_as_is() {
         .call(
             "key-ocr",
             call_body(
-                receipt(),
-                json!({"is_toll": noul("Is this a toll receipt?")}),
+                document(),
+                json!({"is_refund": noul("Is this a refund request?")}),
             ),
         )
         .await;
@@ -37,8 +37,8 @@ async fn a_lone_call_is_forwarded_and_answered_as_is() {
     assert_eq!(reply.status, 200, "{}", reply.text);
     assert_eq!(reply.body["model"], "jev-1.13.0");
     assert_eq!(
-        reply.body["answers"]["is_toll"]["echo"],
-        "Is this a toll receipt?"
+        reply.body["answers"]["is_refund"]["echo"],
+        "Is this a refund request?"
     );
     assert_eq!(
         reply.body["usage"]["input_tokens"],
@@ -50,39 +50,39 @@ async fn a_lone_call_is_forwarded_and_answered_as_is() {
     // Alone, the call goes upstream under the caller's own question ids.
     assert_eq!(
         h.mock.state.questions_of(0),
-        vec![("is_toll".to_owned(), json!("Is this a toll receipt?"))]
+        vec![("is_refund".to_owned(), json!("Is this a refund request?"))]
     );
 }
 
 #[tokio::test]
 async fn calls_sharing_a_state_share_one_upstream_call() {
     let h = Harness::start(Setup::default()).await;
-    let (ocr, fraud, expense) = tokio::join!(
+    let (ocr, fraud, triage) = tokio::join!(
         h.call(
             "key-ocr",
             call_body(
-                receipt(),
-                json!({"is_toll": noul("Is this a toll receipt?"), "q": noul("Is the total readable?")})
+                document(),
+                json!({"is_refund": noul("Is this a refund request?"), "q": noul("Is the total readable?")})
             )
         ),
         h.call(
             "key-fraud",
-            call_body(receipt(), json!({"q": noul("Does this receipt look altered?")}))
+            call_body(document(), json!({"q": noul("Does this document look altered?")}))
         ),
         h.call(
-            "key-expense",
+            "key-triage",
             call_body(
-                receipt(),
+                document(),
                 json!({"category": {
                     "type": "choice",
-                    "instructions": "Which expense category is this?",
-                    "criteria": {"meals": null, "travel": "Tolls, fuel, parking"}
+                    "instructions": "Which topic is this?",
+                    "criteria": {"returns": null, "logistics": "Delivery, tracking, shipping"}
                 }})
             )
         ),
     );
 
-    for reply in [&ocr, &fraud, &expense] {
+    for reply in [&ocr, &fraud, &triage] {
         assert_eq!(reply.status, 200, "{}", reply.text);
         assert_eq!(reply.header("x-systemone-gateway-batch-callers"), "3");
         assert_eq!(reply.header("x-typesafe-request-id"), "req_1");
@@ -93,28 +93,28 @@ async fn calls_sharing_a_state_share_one_upstream_call() {
     // Both ocr and fraud used the id "q"; each gets the answer to its own.
     assert_eq!(ocr.body["answers"].as_object().unwrap().len(), 2);
     assert_eq!(
-        ocr.body["answers"]["is_toll"]["echo"],
-        "Is this a toll receipt?"
+        ocr.body["answers"]["is_refund"]["echo"],
+        "Is this a refund request?"
     );
     assert_eq!(ocr.body["answers"]["q"]["echo"], "Is the total readable?");
     assert_eq!(fraud.body["answers"].as_object().unwrap().len(), 1);
     assert_eq!(
         fraud.body["answers"]["q"]["echo"],
-        "Does this receipt look altered?"
+        "Does this document look altered?"
     );
-    assert_eq!(expense.body["answers"]["category"]["type"], "choice");
+    assert_eq!(triage.body["answers"]["category"]["type"], "choice");
     assert_eq!(
-        expense.body["answers"]["category"]["echo"],
-        "Which expense category is this?"
+        triage.body["answers"]["category"]["echo"],
+        "Which topic is this?"
     );
 
     // The token usage handed back adds up to what TypeSafe billed.
-    let charged: u64 = [&ocr, &fraud, &expense]
+    let charged: u64 = [&ocr, &fraud, &triage]
         .iter()
         .map(|reply| reply.body["usage"]["input_tokens"].as_u64().unwrap())
         .sum();
     assert_eq!(charged, h.mock.state.input_tokens_of(0));
-    let output: u64 = [&ocr, &fraud, &expense]
+    let output: u64 = [&ocr, &fraud, &triage]
         .iter()
         .map(|reply| reply.body["usage"]["output_tokens"].as_u64().unwrap())
         .sum();
@@ -124,8 +124,8 @@ async fn calls_sharing_a_state_share_one_upstream_call() {
 #[tokio::test]
 async fn state_formatting_does_not_prevent_merging() {
     let h = Harness::start(Setup::default()).await;
-    let compact = r#"{"state":{"receipt":"TOTAL 42,50 EUR","merchant":"Vinci"},"model":"jev-latest","questions":{"a":{"type":"noul","instructions":"A?"}}}"#;
-    let pretty = "{\n  \"model\": \"jev-latest\",\n  \"state\": { \"receipt\" : \"TOTAL 42,50 EUR\",\n    \"merchant\" : \"Vinci\" },\n  \"questions\": { \"b\": { \"type\": \"noul\", \"instructions\": \"B?\" } }\n}";
+    let compact = r#"{"state":{"document":"Order 1042, 42.50 EUR","customer":"Example Shop"},"model":"jev-latest","questions":{"a":{"type":"noul","instructions":"A?"}}}"#;
+    let pretty = "{\n  \"model\": \"jev-latest\",\n  \"state\": { \"document\" : \"Order 1042, 42.50 EUR\",\n    \"customer\" : \"Example Shop\" },\n  \"questions\": { \"b\": { \"type\": \"noul\", \"instructions\": \"B?\" } }\n}";
     let (a, b) = tokio::join!(
         h.call_raw("key-ocr", compact),
         h.call_raw("key-fraud", pretty)
@@ -141,12 +141,12 @@ async fn state_formatting_does_not_prevent_merging() {
 async fn identical_questions_from_two_services_are_sent_once() {
     let h = Harness::start(Setup::default()).await;
     let (ocr, fraud) = tokio::join!(
-        h.call("key-ocr", call_body(receipt(), json!({"toll": noul("Is this a toll receipt?")}))),
+        h.call("key-ocr", call_body(document(), json!({"refund": noul("Is this a refund request?")}))),
         h.call(
             "key-fraud",
             call_body(
-                receipt(),
-                json!({"is_toll": noul("Is this a toll receipt?"), "altered": noul("Does it look altered?")})
+                document(),
+                json!({"is_refund": noul("Is this a refund request?"), "altered": noul("Does it look altered?")})
             )
         ),
     );
@@ -155,12 +155,12 @@ async fn identical_questions_from_two_services_are_sent_once() {
     assert_eq!(h.mock.state.calls(), 1);
     assert_eq!(h.mock.state.questions_of(0).len(), 2);
     assert_eq!(
-        ocr.body["answers"]["toll"]["echo"],
-        "Is this a toll receipt?"
+        ocr.body["answers"]["refund"]["echo"],
+        "Is this a refund request?"
     );
     assert_eq!(
-        fraud.body["answers"]["is_toll"]["echo"],
-        "Is this a toll receipt?"
+        fraud.body["answers"]["is_refund"]["echo"],
+        "Is this a refund request?"
     );
     assert_eq!(
         fraud.body["answers"]["altered"]["echo"],
@@ -176,16 +176,16 @@ async fn identical_questions_from_two_services_are_sent_once() {
 #[tokio::test]
 async fn different_states_or_models_are_not_merged() {
     let h = Harness::start(Setup::default()).await;
-    let question = json!({"q": noul("Is this a toll receipt?")});
-    let mut other_model = call_body(receipt(), question.clone());
+    let question = json!({"q": noul("Is this a refund request?")});
+    let mut other_model = call_body(document(), question.clone());
     other_model["model"] = json!("jev-1.13.0");
     let (a, b, c) = tokio::join!(
-        h.call("key-ocr", call_body(receipt(), question.clone())),
+        h.call("key-ocr", call_body(document(), question.clone())),
         h.call(
             "key-fraud",
-            call_body(json!("another receipt"), question.clone())
+            call_body(json!("another document"), question.clone())
         ),
-        h.call("key-expense", &other_model),
+        h.call("key-triage", &other_model),
     );
     for reply in [&a, &b, &c] {
         assert_eq!(reply.status, 200, "{}", reply.text);
@@ -197,7 +197,7 @@ async fn different_states_or_models_are_not_merged() {
 #[tokio::test]
 async fn unknown_keys_never_reach_typesafe() {
     let h = Harness::start(Setup::default()).await;
-    let body = call_body(receipt(), json!({"q": noul("?")}));
+    let body = call_body(document(), json!({"q": noul("?")}));
     let wrong = h.call("key-nobody", &body).await;
     assert_eq!(wrong.status, 401);
     assert_eq!(wrong.body["error"]["type"], "authentication_error");
@@ -219,7 +219,7 @@ async fn unknown_keys_never_reach_typesafe() {
 async fn bad_requests_are_answered_locally_with_the_field_at_fault() {
     let h = Harness::start(Setup::default()).await;
     let one_level = call_body(
-        receipt(),
+        document(),
         json!({"size": {"type": "score", "instructions": "How big?", "criteria": ["only one"]}}),
     );
     let reply = h.call("key-ocr", &one_level).await;
@@ -249,13 +249,13 @@ async fn a_429_from_typesafe_is_retried_after_retry_after_ms() {
     let reply = h
         .call(
             "key-ocr",
-            call_body(receipt(), json!({"q": noul("Is this a toll receipt?")})),
+            call_body(document(), json!({"q": noul("Is this a refund request?")})),
         )
         .await;
     assert_eq!(reply.status, 200, "{}", reply.text);
     assert_eq!(
         reply.body["answers"]["q"]["echo"],
-        "Is this a toll receipt?"
+        "Is this a refund request?"
     );
     assert_eq!(h.mock.state.calls(), 2);
     assert!(started.elapsed() >= Duration::from_millis(50));
@@ -277,7 +277,7 @@ async fn when_retries_run_out_the_vendor_status_is_passed_through() {
     h.mock.state.push(Scripted::status(529, overloaded));
     h.mock.state.push(Scripted::status(529, overloaded));
     let reply = h
-        .call("key-ocr", call_body(receipt(), json!({"q": noul("?")})))
+        .call("key-ocr", call_body(document(), json!({"q": noul("?")})))
         .await;
     assert_eq!(reply.status, 529);
     assert_eq!(reply.text, overloaded);
@@ -290,17 +290,20 @@ async fn a_rejected_merged_call_is_replayed_so_only_the_culprit_fails() {
     let (bad, good) = tokio::join!(
         h.call(
             "key-ocr",
-            call_body(receipt(), json!({"q": noul("POISON: reject me")}))
+            call_body(document(), json!({"q": noul("POISON: reject me")}))
         ),
         h.call(
             "key-fraud",
-            call_body(receipt(), json!({"q": noul("Is this a toll receipt?")}))
+            call_body(document(), json!({"q": noul("Is this a refund request?")}))
         ),
     );
     assert_eq!(bad.status, 422, "{}", bad.text);
     assert_eq!(bad.body["detail"][0]["msg"], "poisoned question");
     assert_eq!(good.status, 200, "{}", good.text);
-    assert_eq!(good.body["answers"]["q"]["echo"], "Is this a toll receipt?");
+    assert_eq!(
+        good.body["answers"]["q"]["echo"],
+        "Is this a refund request?"
+    );
     // The merged call, then one replay per caller.
     assert_eq!(h.mock.state.calls(), 3);
     assert!(
@@ -316,7 +319,7 @@ async fn a_vendor_client_error_on_a_lone_call_is_passed_through() {
     let detail = r#"{"detail":[{"loc":["body","questions","q"],"msg":"context too long"}]}"#;
     h.mock.state.push(Scripted::status(422, detail));
     let reply = h
-        .call("key-ocr", call_body(receipt(), json!({"q": noul("?")})))
+        .call("key-ocr", call_body(document(), json!({"q": noul("?")})))
         .await;
     assert_eq!(reply.status, 422);
     assert_eq!(reply.text, detail);
@@ -330,7 +333,7 @@ async fn a_service_over_its_own_rate_gets_429_with_retry_after() {
         ..Setup::default()
     })
     .await;
-    let body = call_body(receipt(), json!({"q": noul("?")}));
+    let body = call_body(document(), json!({"q": noul("?")}));
     assert_eq!(h.call("key-ocr", &body).await.status, 200);
     let refused = h.call("key-ocr", &body).await;
     assert_eq!(refused.status, 429);
@@ -351,10 +354,10 @@ async fn under_saturation_calls_join_a_waiting_batch_and_the_rest_are_shed() {
         ..Setup::default()
     })
     .await;
-    let first = call_body(json!("receipt A"), json!({"a": noul("A?")}));
-    let second = call_body(json!("receipt B"), json!({"b": noul("B?")}));
-    let joins = call_body(json!("receipt B"), json!({"c": noul("C?")}));
-    let too_late = call_body(json!("receipt D"), json!({"d": noul("D?")}));
+    let first = call_body(json!("document A"), json!({"a": noul("A?")}));
+    let second = call_body(json!("document B"), json!({"b": noul("B?")}));
+    let joins = call_body(json!("document B"), json!({"c": noul("C?")}));
+    let too_late = call_body(json!("document D"), json!({"d": noul("D?")}));
 
     let (a, b, c, d) = tokio::join!(
         h.call("key-ocr", &first),
@@ -364,7 +367,7 @@ async fn under_saturation_calls_join_a_waiting_batch_and_the_rest_are_shed() {
         },
         async {
             sleep(Duration::from_millis(200)).await;
-            h.call("key-expense", &joins).await
+            h.call("key-triage", &joins).await
         },
         async {
             sleep(Duration::from_millis(300)).await;
@@ -405,7 +408,7 @@ async fn a_bad_gateway_key_shows_up_as_502_not_as_the_callers_401() {
     })
     .await;
     let reply = h
-        .call("key-ocr", call_body(receipt(), json!({"q": noul("?")})))
+        .call("key-ocr", call_body(document(), json!({"q": noul("?")})))
         .await;
     assert_eq!(reply.status, 502);
     assert_eq!(reply.body["error"]["type"], "upstream_error");
@@ -425,7 +428,7 @@ async fn a_slow_upstream_gets_a_504_within_the_request_timeout() {
     h.mock.state.set_delay(Duration::from_secs(3));
     let started = Instant::now();
     let reply = h
-        .call("key-ocr", call_body(receipt(), json!({"q": noul("?")})))
+        .call("key-ocr", call_body(document(), json!({"q": noul("?")})))
         .await;
     assert_eq!(reply.status, 504, "{}", reply.text);
     assert_eq!(reply.body["error"]["type"], "timeout_error");
@@ -443,7 +446,7 @@ async fn a_service_limited_to_some_models_gets_403_for_others() {
         ..Setup::default()
     })
     .await;
-    let mut body = call_body(receipt(), json!({"q": noul("?")}));
+    let mut body = call_body(document(), json!({"q": noul("?")}));
     body["model"] = json!("jev-preview");
     let reply = h.call("key-ocr", &body).await;
     assert_eq!(reply.status, 403);
@@ -457,12 +460,15 @@ async fn metrics_account_per_service_and_per_upstream_call() {
     let (ocr, fraud) = tokio::join!(
         h.call(
             "key-ocr",
-            call_body(receipt(), json!({"a": noul("A?"), "b": noul("B?")}))
+            call_body(document(), json!({"a": noul("A?"), "b": noul("B?")}))
         ),
-        h.call("key-fraud", call_body(receipt(), json!({"c": noul("C?")}))),
+        h.call("key-fraud", call_body(document(), json!({"c": noul("C?")}))),
     );
     let _ = h
-        .call("key-nobody", call_body(receipt(), json!({"c": noul("C?")})))
+        .call(
+            "key-nobody",
+            call_body(document(), json!({"c": noul("C?")})),
+        )
         .await;
     let metrics = h.metrics().await;
     for line in [
@@ -514,7 +520,7 @@ async fn shutdown_lets_in_flight_calls_finish() {
         .client
         .post(h.url("/v1/systemone"))
         .bearer_auth("key-ocr")
-        .body(call_body(receipt(), json!({"q": noul("Still there?")})).to_string())
+        .body(call_body(document(), json!({"q": noul("Still there?")})).to_string())
         .send();
     let in_flight = tokio::spawn(request);
     sleep(Duration::from_millis(100)).await;
@@ -539,7 +545,7 @@ async fn a_spent_tokens_per_second_budget_sheds_with_429() {
     .await;
     h.mock.state.set_delay(Duration::from_millis(1_500));
     let first = h
-        .call("key-ocr", call_body(receipt(), json!({"a": noul("A?")})))
+        .call("key-ocr", call_body(document(), json!({"a": noul("A?")})))
         .await;
     assert_eq!(first.status, 200, "{}", first.text);
     h.mock.state.set_delay(Duration::ZERO);
@@ -547,7 +553,7 @@ async fn a_spent_tokens_per_second_budget_sheds_with_429() {
     let second = h
         .call(
             "key-fraud",
-            call_body(json!("another receipt"), json!({"b": noul("B?")})),
+            call_body(json!("another document"), json!({"b": noul("B?")})),
         )
         .await;
     assert_eq!(second.status, 429, "{}", second.text);
@@ -578,7 +584,7 @@ async fn a_call_stuck_behind_busy_upstream_slots_gets_429_instead_of_a_late_send
     let (first, (second, waited)) = tokio::join!(
         h.call(
             "key-ocr",
-            call_body(json!("receipt A"), json!({"a": noul("A?")}))
+            call_body(json!("document A"), json!({"a": noul("A?")}))
         ),
         async {
             sleep(Duration::from_millis(50)).await;
@@ -586,7 +592,7 @@ async fn a_call_stuck_behind_busy_upstream_slots_gets_429_instead_of_a_late_send
             let reply = h
                 .call(
                     "key-fraud",
-                    call_body(json!("receipt B"), json!({"b": noul("B?")})),
+                    call_body(json!("document B"), json!({"b": noul("B?")})),
                 )
                 .await;
             (reply, sent.elapsed())
@@ -618,7 +624,7 @@ async fn a_zero_queue_wait_still_serves_an_idle_gateway() {
         let reply = h
             .call(
                 "key-ocr",
-                call_body(json!(format!("receipt {n}")), json!({"q": noul("?")})),
+                call_body(json!(format!("document {n}")), json!({"q": noul("?")})),
             )
             .await;
         assert_eq!(reply.status, 200, "{}", reply.text);
@@ -645,21 +651,21 @@ async fn batches_held_by_a_429_pause_leave_spaced_out() {
     let (a, b, c) = tokio::join!(
         h.call(
             "key-ocr",
-            call_body(json!("receipt A"), json!({"a": noul("A?")}))
+            call_body(json!("document A"), json!({"a": noul("A?")}))
         ),
         async {
             sleep(Duration::from_millis(50)).await;
             h.call(
                 "key-fraud",
-                call_body(json!("receipt B"), json!({"b": noul("B?")})),
+                call_body(json!("document B"), json!({"b": noul("B?")})),
             )
             .await
         },
         async {
             sleep(Duration::from_millis(100)).await;
             h.call(
-                "key-expense",
-                call_body(json!("receipt C"), json!({"c": noul("C?")})),
+                "key-triage",
+                call_body(json!("document C"), json!({"c": noul("C?")})),
             )
             .await
         },
@@ -688,7 +694,7 @@ async fn a_vendor_403_reaches_the_caller_as_is() {
     let denied = r#"{"detail":"model not available on this plan"}"#;
     h.mock.state.push(Scripted::status(403, denied));
     let reply = h
-        .call("key-ocr", call_body(receipt(), json!({"q": noul("?")})))
+        .call("key-ocr", call_body(document(), json!({"q": noul("?")})))
         .await;
     assert_eq!(reply.status, 403);
     assert_eq!(reply.text, denied);

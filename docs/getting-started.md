@@ -67,8 +67,8 @@ export SERVICE_KEY=s1gw_...
 curl -s http://localhost:8080/v1/systemone \
   -H "Authorization: Bearer $SERVICE_KEY" \
   -H 'content-type: application/json' \
-  -d '{"state": "Parking Saemes - 18,00 EUR", "model": "jev-latest",
-       "questions": {"parking": {"type": "noul", "instructions": "Is this a parking receipt?"}}}'
+  -d '{"state": "Order 1042 - refund request, 18.00 EUR", "model": "jev-latest",
+       "questions": {"refund": {"type": "noul", "instructions": "Is this a refund request?"}}}'
 ```
 
 ```sh
@@ -139,8 +139,8 @@ TYPESAFE_API_KEY=mock-typesafe-key cargo run -- serve --config gateway.toml
 curl -si http://localhost:8080/v1/systemone \
   -H "Authorization: Bearer $SERVICE_KEY" \
   -H 'content-type: application/json' \
-  -d '{"state": "Parking Saemes - 18,00 EUR", "model": "jev-latest",
-       "questions": {"parking": {"type": "noul", "instructions": "Is this a parking receipt?"}}}'
+  -d '{"state": "Order 1042 - refund request, 18.00 EUR", "model": "jev-latest",
+       "questions": {"refund": {"type": "noul", "instructions": "Is this a refund request?"}}}'
 ```
 
 ```
@@ -151,7 +151,7 @@ x-systemone-gateway-batch-callers: 1
 x-systemone-gateway-backend: typesafe
 x-request-id: 6c4f9a18-bf9f-49a5-ba81-d6d92061f1cb
 
-{"answers":{"parking":{"echo":"Is this a parking receipt?","noul":0.75,"type":"noul"}},"model":"jev-1.13.0","usage":{"input_tokens":35,"output_tokens":10}}
+{"answers":{"refund":{"echo":"Is this a refund request?","noul":0.75,"type":"noul"}},"model":"jev-1.13.0","usage":{"input_tokens":38,"output_tokens":10}}
 ```
 
 ### A call to the chat backend
@@ -163,11 +163,11 @@ chat API. This one adds a Choice question, which shows the probabilities:
 curl -si http://localhost:8080/v1/systemone \
   -H "Authorization: Bearer $SERVICE_KEY" \
   -H 'content-type: application/json' \
-  -d '{"state": "Parking Saemes - 18,00 EUR", "model": "Qwen/Qwen2.5-7B-Instruct",
+  -d '{"state": "Order 1042 - refund request, 18.00 EUR", "model": "Qwen/Qwen2.5-7B-Instruct",
        "questions": {
-         "parking": {"type": "noul", "instructions": "Is this a parking receipt?"},
+         "refund": {"type": "noul", "instructions": "Is this a refund request?"},
          "cat": {"type": "choice", "instructions": "Category?",
-                 "criteria": {"tolls": "Motorway tolls", "fuel": null, "meals": "Restaurants"}}}}'
+                 "criteria": {"billing": "Billing and payments", "shipping": null, "returns": "Returns and exchanges"}}}}'
 ```
 
 The answer comes back in TypeSafe's format:
@@ -175,11 +175,11 @@ The answer comes back in TypeSafe's format:
 ```
 HTTP/1.1 200 OK
 content-type: application/json
-x-typesafe-request-id: chat_2
+x-typesafe-request-id: chat_1
 x-systemone-gateway-batch-callers: 1
 x-systemone-gateway-backend: huggingface
 
-{"model":"Qwen/Qwen2.5-7B-Instruct","answers":{"parking":{"type":"noul","noul":0.7216494845360825},"cat":{"type":"choice","choice":"tolls","probabilities":{"tolls":0.6666666666666666,"fuel":0.33333333333333337,"meals":0.0},"confidence":0.5}},"usage":{"input_tokens":239,"output_tokens":2}}
+{"model":"Qwen/Qwen2.5-7B-Instruct","answers":{"refund":{"type":"noul","noul":0.7216494845360825},"cat":{"type":"choice","choice":"billing","probabilities":{"billing":0.6666666666666666,"shipping":0.33333333333333337,"returns":0.0},"confidence":0.5}},"usage":{"input_tokens":251,"output_tokens":2}}
 ```
 
 ### Two services, one upstream call
@@ -190,10 +190,10 @@ own answer and its share of the tokens:
 
 ```
 HTTP 200  x-typesafe-request-id: req_2  x-systemone-gateway-batch-callers: 2
-{"answers":{"is_toll":{...}},"model":"jev-1.13.0","usage":{"input_tokens":25,"output_tokens":10}}
+{"answers":{"is_refund":{...}},"model":"jev-1.13.0","usage":{"input_tokens":27,"output_tokens":10}}
 
 HTTP 200  x-typesafe-request-id: req_2  x-systemone-gateway-batch-callers: 2
-{"answers":{"altered":{...}},"model":"jev-1.13.0","usage":{"input_tokens":24,"output_tokens":10}}
+{"answers":{"altered":{...}},"model":"jev-1.13.0","usage":{"input_tokens":25,"output_tokens":10}}
 ```
 
 Both responses carry the same request id and `batch-callers: 2`. Read

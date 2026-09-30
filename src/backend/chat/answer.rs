@@ -208,14 +208,14 @@ mod tests {
     #[test]
     fn a_noul_adds_spellings_of_the_same_label_and_drops_other_tokens() {
         let prompt = Prompt::new(
-            "Parking Saemes - 18,00 EUR",
-            &raw(r#"{"type":"noul","instructions":"Is this a parking receipt?","criteria":{"true":"a car park"}}"#),
+            "Order 1042 - refund request, 18.00 EUR",
+            &raw(r#"{"type":"noul","instructions":"Is this a refund request?","criteria":{"true":"a refund"}}"#),
         )
         .unwrap();
         assert!(prompt.user.starts_with(
-            "State:\nParking Saemes - 18,00 EUR\n\nQuestion: Is this a parking receipt?\n"
+            "State:\nOrder 1042 - refund request, 18.00 EUR\n\nQuestion: Is this a refund request?\n"
         ));
-        assert!(prompt.user.contains("Answer Yes if: a car park\n"));
+        assert!(prompt.user.contains("Answer Yes if: a refund\n"));
         assert!(!prompt.user.contains("Answer No if"));
 
         let answer = prompt

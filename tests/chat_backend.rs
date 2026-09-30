@@ -17,7 +17,7 @@ fn noul(instructions: &str) -> Value {
 
 fn call_body(model: &str, questions: Value) -> Value {
     json!({
-        "state": {"receipt": "TOTAL TTC 42,50 EUR - Peage A7", "merchant": "Vinci Autoroutes"},
+        "state": {"document": "Order 1042 - refund request, 42.50 EUR", "customer": "Example Shop"},
         "model": model,
         "questions": questions,
     })
@@ -42,18 +42,18 @@ async fn every_question_type_comes_back_in_typesafe_shape() {
     // Raw text: `serde_json::Value` would sort the options, and their order
     // decides which letter each one gets.
     let body = r#"{
-        "state": {"receipt": "TOTAL TTC 42,50 EUR - Peage A7", "merchant": "Vinci Autoroutes"},
+        "state": {"document": "Order 1042 - refund request, 42.50 EUR", "customer": "Example Shop"},
         "model": "Qwen/Qwen2.5-7B-Instruct",
         "questions": {
-            "toll": {"type": "noul", "instructions": "Is this a toll receipt? yes=0.9"},
+            "refund": {"type": "noul", "instructions": "Is this a refund request? yes=0.9"},
             "category": {
                 "type": "choice",
-                "instructions": "Which expense category?",
-                "criteria": {"tolls": "Motorway tolls", "fuel": null, "meals": "Restaurants"}
+                "instructions": "Which topic?",
+                "criteria": {"billing": "Billing and payments", "shipping": null, "returns": "Returns and exchanges"}
             },
             "legibility": {
                 "type": "score",
-                "instructions": "How legible is the receipt?",
+                "instructions": "How legible is the document?",
                 "criteria": ["Unreadable", "Partly readable", "Clear"]
             }
         }
@@ -66,20 +66,20 @@ async fn every_question_type_comes_back_in_typesafe_shape() {
 
     // The mock puts 0.9 on " Yes" and "Yes" together and 0.09 on "No";
     // "Maybe" is no label and drops out.
-    assert_eq!(answers["toll"]["type"], "noul");
+    assert_eq!(answers["refund"]["type"], "noul");
     assert!(
-        close(&answers["toll"]["noul"], 0.9 / 0.99),
+        close(&answers["refund"]["noul"], 0.9 / 0.99),
         "{}",
         reply.text
     );
-    assert!(answers["toll"].get("confidence").is_none());
+    assert!(answers["refund"].get("confidence").is_none());
 
     // A: 0.6, " B": 0.3, "The": 0.1 dropped.
     let category = &answers["category"];
-    assert_eq!(category["choice"], "tolls");
-    assert!(close(&category["probabilities"]["tolls"], 2.0 / 3.0));
-    assert!(close(&category["probabilities"]["fuel"], 1.0 / 3.0));
-    assert!(close(&category["probabilities"]["meals"], 0.0));
+    assert_eq!(category["choice"], "billing");
+    assert!(close(&category["probabilities"]["billing"], 2.0 / 3.0));
+    assert!(close(&category["probabilities"]["shipping"], 1.0 / 3.0));
+    assert!(close(&category["probabilities"]["returns"], 0.0));
     assert!(close(&category["confidence"], 0.5));
 
     // "1": 0.5, "2": 0.3, "Level": 0.2 dropped.
@@ -98,13 +98,17 @@ async fn every_question_type_comes_back_in_typesafe_shape() {
         assert_eq!(request["logprobs"], true);
         assert_eq!(request["top_logprobs"], 5);
         let prompt = request["messages"][1]["content"].as_str().unwrap();
-        assert!(prompt.starts_with("State:\n{\"receipt\":\"TOTAL TTC 42,50 EUR - Peage A7\""));
+        assert!(
+            prompt.starts_with("State:\n{\"document\":\"Order 1042 - refund request, 42.50 EUR\"")
+        );
     }
     assert!(
         requests[1]["messages"][1]["content"]
             .as_str()
             .unwrap()
-            .contains("A. tolls: Motorway tolls\nB. fuel\nC. meals: Restaurants\n")
+            .contains(
+                "A. billing: Billing and payments\nB. shipping\nC. returns: Returns and exchanges\n"
+            )
     );
     assert_eq!(
         h.mock.state.calls(),
@@ -127,14 +131,14 @@ async fn services_share_a_chat_batch_and_a_shared_question_is_asked_once() {
     let (ocr, fraud) = tokio::join!(
         h.call(
             "key-ocr",
-            call_body(QWEN, json!({"toll": noul("Is this a toll? yes=0.2")}))
+            call_body(QWEN, json!({"refund": noul("Is this a refund? yes=0.2")}))
         ),
         h.call(
             "key-fraud",
             call_body(
                 QWEN,
                 json!({
-                    "is_toll": noul("Is this a toll? yes=0.2"),
+                    "is_refund": noul("Is this a refund? yes=0.2"),
                     "altered": noul("Was the amount altered? yes=0.6"),
                 })
             )
@@ -146,8 +150,11 @@ async fn services_share_a_chat_batch_and_a_shared_question_is_asked_once() {
     assert_eq!(h.mock.state.chat_requests().len(), 2);
 
     // yes=0.2: 0.2 on Yes, 0.72 on No. yes=0.6: 0.6 and 0.36.
-    assert!(close(&ocr.body["answers"]["toll"]["noul"], 0.2 / 0.92));
-    assert!(close(&fraud.body["answers"]["is_toll"]["noul"], 0.2 / 0.92));
+    assert!(close(&ocr.body["answers"]["refund"]["noul"], 0.2 / 0.92));
+    assert!(close(
+        &fraud.body["answers"]["is_refund"]["noul"],
+        0.2 / 0.92
+    ));
     assert!(close(&fraud.body["answers"]["altered"]["noul"], 0.6 / 0.96));
     assert!(ocr.body["answers"].get("altered").is_none());
 
@@ -262,7 +269,7 @@ async fn a_refused_chat_key_is_a_502() {
 #[tokio::test]
 async fn upstream_model_top_logprobs_and_extras_reach_the_chat_api() {
     let h = Harness::start(chat_setup(
-        "upstream_model = \"example/receipt-judge\"\ntop_logprobs = 3\n\
+        "upstream_model = \"example/document-judge\"\ntop_logprobs = 3\n\
          [backend.request_extras]\ntemperature = 0\nmax_tokens = 50\n",
     ))
     .await;
@@ -271,14 +278,14 @@ async fn upstream_model_top_logprobs_and_extras_reach_the_chat_api() {
         .await;
     assert_eq!(reply.status, 200, "{}", reply.text);
     let request = &h.mock.state.chat_requests()[0];
-    assert_eq!(request["model"], "example/receipt-judge");
+    assert_eq!(request["model"], "example/document-judge");
     assert_eq!(request["top_logprobs"], 3);
     assert_eq!(request["temperature"], 0);
     // The gateway's own fields win over the extras.
     assert_eq!(request["max_tokens"], 1);
     // The mock returned 3 candidates: " Yes", "Yes", "No".
     assert!(close(&reply.body["answers"]["q"]["noul"], 0.9 / 0.99));
-    assert_eq!(reply.body["model"], "example/receipt-judge");
+    assert_eq!(reply.body["model"], "example/document-judge");
 }
 
 #[tokio::test]

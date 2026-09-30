@@ -38,10 +38,10 @@ curl -s http://localhost:8080/v1/systemone \
   -H "Authorization: Bearer $TYPESAFE_API_KEY" \
   -H 'content-type: application/json' \
   -d '{
-    "state": "Parking Saemes - 18,00 EUR",
+    "state": "Order 1042 - refund request, 18.00 EUR",
     "model": "jev-latest",
     "questions": {
-      "parking": {"type": "noul", "instructions": "Is this a parking receipt?"}
+      "refund": {"type": "noul", "instructions": "Is this a refund request?"}
     }
   }'
 ```
@@ -79,9 +79,9 @@ the caller's own question ids:
 
 ```json
 {
-  "answers": {"parking": {"type": "noul", "noul": 0.72}},
+  "answers": {"refund": {"type": "noul", "noul": 0.72}},
   "model": "jev-1.13.0",
-  "usage": {"input_tokens": 35, "output_tokens": 10}
+  "usage": {"input_tokens": 38, "output_tokens": 10}
 }
 ```
 

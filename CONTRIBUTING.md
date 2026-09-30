@@ -77,8 +77,8 @@ tests use, and it also serves a chat completions API with logprobs under
    curl -s http://127.0.0.1:8080/v1/systemone \
      -H "Authorization: Bearer <key printed by gen-key>" \
      -H 'content-type: application/json' \
-     -d '{"state": "Parking receipt, 18 EUR", "model": "jev-latest",
-          "questions": {"parking": {"type": "noul", "instructions": "Is this a parking receipt?"}}}'
+     -d '{"state": "Order 1042 - refund request, 18 EUR", "model": "jev-latest",
+          "questions": {"refund": {"type": "noul", "instructions": "Is this a refund request?"}}}'
    ```
 
    The mock adds an `echo` field to each answer so you can see which answer

@@ -43,7 +43,7 @@ impl Default for Setup {
             services: vec![
                 ("ocr", "key-ocr", ""),
                 ("fraud", "key-fraud", ""),
-                ("expense", "key-expense", ""),
+                ("triage", "key-triage", ""),
             ],
             gateway_key: UPSTREAM_KEY,
         }

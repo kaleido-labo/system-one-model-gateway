@@ -137,8 +137,8 @@ mod tests {
     #[test]
     fn minify_keeps_non_ascii_text() {
         assert_eq!(
-            minify("{ \"note\" : \"frais de péage — 12 €\" }"),
-            "{\"note\":\"frais de péage — 12 €\"}"
+            minify("{ \"note\" : \"remboursement demandé — 12 €\" }"),
+            "{\"note\":\"remboursement demandé — 12 €\"}"
         );
     }
 

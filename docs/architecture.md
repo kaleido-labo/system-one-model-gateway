@@ -9,7 +9,7 @@ the [configuration reference](configuration.md).
 ```
  ocr-service ─┐
  fraud-check ─┼─> [1 receive] ─> [2 authenticate] ─> [3 validate] ─> [4 route]
- expense-cat ─┘                                                          │
+ triage ─┘                                                          │
                                                                          v
                                    [5 admit: per-service rate and concurrency]
                                                                          │

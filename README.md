@@ -23,7 +23,7 @@ backend. When TypeSafe answers 429, the gateway pauses all traffic to it at once
 and a service that calls too often gets a 429 from the gateway before it takes
 capacity from the others.
 
-When three services ask about the same receipt, the receipt is billed three
+When three services ask about the same document, the document is billed three
 times. TypeSafe charges per input token, and the state is often most of them. The
 gateway sends calls about the same state upstream once.
 
@@ -62,8 +62,8 @@ export SERVICE_KEY=s1gw_...
 curl -s http://localhost:8080/v1/systemone \
   -H "Authorization: Bearer $SERVICE_KEY" \
   -H 'content-type: application/json' \
-  -d '{"state": "Parking Saemes - 18,00 EUR", "model": "jev-latest",
-       "questions": {"parking": {"type": "noul", "instructions": "Is this a parking receipt?"}}}'
+  -d '{"state": "Order 1042 - refund request, 18.00 EUR", "model": "jev-latest",
+       "questions": {"refund": {"type": "noul", "instructions": "Is this a refund request?"}}}'
 ```
 
 To point an existing service at the gateway, set `TYPESAFE_BASE_URL` to the

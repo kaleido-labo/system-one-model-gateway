@@ -95,9 +95,9 @@ State:
 
 Question: <instructions>
 Options:
-A. tolls: Motorway tolls
-B. fuel
-C. meals: Restaurants
+A. billing: Billing and payments
+B. shipping
+C. returns: Returns and exchanges
 
 Reply with the letter of one option only.
 ```
