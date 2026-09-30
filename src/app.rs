@@ -10,9 +10,9 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::info;
 
-use crate::api::{AppState, Shared, admin_router, public_router};
 use crate::backend::Backends;
 use crate::config::{Config, millis};
+use crate::http::{AppState, Shared, admin_router, public_router};
 use crate::metrics::Metrics;
 use crate::services::ServiceRegistry;
 use crate::wire::TokenEstimator;

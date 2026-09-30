@@ -8,11 +8,11 @@
 //! limits, retries what can be retried, and hands each caller back its own
 //! answers and its share of the token usage.
 
-mod api;
 mod app;
 mod backend;
 mod config;
 mod error;
+mod http;
 mod metrics;
 mod scheduling;
 mod services;
