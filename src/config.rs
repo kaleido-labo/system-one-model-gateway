@@ -1,5 +1,6 @@
 //! Gateway configuration, read from a TOML file: the server, the merge window,
-//! the backends (`backend`) and the services allowed to call the gateway.
+//! the backends (`backend`), tracing (`traces`) and the services allowed to
+//! call the gateway.
 //!
 //! The file holds no secret: services are identified by the SHA-256 of their
 //! key, and each backend's key is read from the environment variable the
@@ -15,9 +16,11 @@ use serde::Deserialize;
 
 mod backend;
 mod pattern;
+mod traces;
 
 pub use backend::{BackendConfig, Protocol};
 pub use pattern::{ModelPattern, best_match, parse_all};
+pub use traces::{TracesEndpoint, TracingConfig};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -32,6 +35,8 @@ pub struct Config {
     pub backends: Vec<BackendConfig>,
     #[serde(default)]
     pub coalescing: CoalescingConfig,
+    #[serde(default)]
+    pub tracing: TracingConfig,
     #[serde(default, rename = "service")]
     pub services: Vec<ServiceConfig>,
 }
@@ -205,6 +210,8 @@ impl Config {
             "coalescing.max_state_plus_question_tokens must be positive"
         );
 
+        self.tracing.validate()?;
+
         if self.services.is_empty() {
             bail!("no [[service]] configured: nobody could call the gateway");
         }
@@ -288,6 +295,31 @@ mod tests {
         assert_eq!(config.coalescing.window_ms, 10);
         assert_eq!(config.server.listen.port(), 8080);
         assert_eq!(config.services[0].burst(), None);
+    }
+
+    #[test]
+    fn tracing_is_off_by_default_and_its_table_is_strict() {
+        let config = Config::from_toml(&with_service("")).unwrap();
+        assert_eq!(config.tracing.otlp_endpoint, None);
+        assert_eq!(config.tracing.service_name, "systemone-gateway");
+        assert_eq!(config.tracing.sample_ratio, 1.0);
+
+        let on = format!(
+            "[tracing]\notlp_endpoint = \"http://collector:4318\"\nsample_ratio = 0.25\n{}",
+            with_service("")
+        );
+        let config = Config::from_toml(&on).unwrap();
+        assert_eq!(
+            config.tracing.otlp_endpoint.as_deref(),
+            Some("http://collector:4318")
+        );
+        assert_eq!(config.tracing.sample_ratio, 0.25);
+
+        let typo = format!("[tracing]\nsample_rate = 0.5\n{}", with_service(""));
+        assert!(Config::from_toml(&typo).is_err());
+        let too_much = format!("[tracing]\nsample_ratio = 2\n{}", with_service(""));
+        let err = Config::from_toml(&too_much).unwrap_err();
+        assert!(err.to_string().contains("tracing.sample_ratio"), "{err}");
     }
 
     #[test]

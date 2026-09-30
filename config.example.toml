@@ -163,6 +163,27 @@ max_state_plus_question_tokens = 28000
 bytes_per_token = 3.0
 
 # ---------------------------------------------------------------------------
+# [tracing]: OpenTelemetry traces, off unless an endpoint is set
+# ---------------------------------------------------------------------------
+#
+# What a trace shows, and how calls merged into one batch are linked:
+# docs/operations.md#traces
+
+[tracing]
+# Base URL of an OTLP/HTTP collector (port 4318, not the gRPC port 4317). The
+# gateway posts to <otlp_endpoint>/v1/traces. Unset turns tracing off: no
+# exporter, no traceparent read or sent. When unset, the gateway still honours
+# OTEL_EXPORTER_OTLP_TRACES_ENDPOINT (a full URL), then OTEL_EXPORTER_OTLP_ENDPOINT
+# (a base URL). This key wins over both.
+# otlp_endpoint = "http://localhost:4318"
+# How the gateway appears in the tracing backend.
+service_name = "systemone-gateway"
+# Share of the traces the gateway starts that are kept, from 0 to 1. A call that
+# arrives with a traceparent follows its caller's decision instead. Headers for
+# a hosted collector go in OTEL_EXPORTER_OTLP_HEADERS.
+sample_ratio = 1.0
+
+# ---------------------------------------------------------------------------
 # [[service]]: one block per calling service
 # ---------------------------------------------------------------------------
 #
