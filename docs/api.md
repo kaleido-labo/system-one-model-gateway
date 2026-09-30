@@ -25,8 +25,9 @@ hash up among the `key_sha256` values of the configuration, so a missing or
 unknown key gets a 401 and never reaches a backend. The admin port has no
 authentication.
 
-The TypeSafe SDKs read `TYPESAFE_BASE_URL` and `TYPESAFE_API_KEY`, so pointing
-a service at the gateway is a matter of setting both.
+The TypeSafe Python SDK reads `TYPESAFE_BASE_URL` and `TYPESAFE_API_KEY`, so
+pointing a service at the gateway is a matter of setting both. For another SDK,
+check how it takes a base URL.
 
 ## `POST /v1/systemone`
 

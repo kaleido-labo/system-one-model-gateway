@@ -78,8 +78,9 @@ curl -s localhost:9090/metrics | grep calls_total
 
 ## Point a service at the gateway
 
-The TypeSafe Python and JavaScript SDKs read their base URL and key from the
-environment. Two variables are enough, and the service's code stays as it is:
+The TypeSafe Python SDK reads its base URL and key from the environment. Two
+variables are enough, and the service's code stays as it is (for another SDK,
+check how it takes a base URL):
 
 ```sh
 TYPESAFE_BASE_URL=http://systemone-gateway:8080
