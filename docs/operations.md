@@ -77,11 +77,85 @@ scrape_configs:
 
 Leave `authorization` out when the gateway has no admin token.
 
-Pacing, quotas and merging live in memory, so they apply per process. With N
-replicas, give each replica 1/N of each backend's `requests_per_minute` and
-`tokens_per_second`, and expect merging only between calls that reach the same
-replica. If merging matters, run fewer and larger replicas, or route calls for
-the same state to the same replica.
+Without a `[cluster]` table, pacing, quotas and merging live in memory, so they
+apply per process. With N replicas, give each replica 1/N of each backend's
+`requests_per_minute` and `tokens_per_second`, and expect merging only between
+calls that reach the same replica. If merging matters, run fewer and larger
+replicas, or route calls for the same state to the same replica. To stop
+dividing the limits by hand, share them through Redis.
+
+### Sharing the limits between replicas
+
+With [`[cluster]`](configuration.md#cluster), the replicas keep these limits in
+Redis and draw on one budget: each backend's `requests_per_minute` and
+`tokens_per_second`, each service's `requests_per_minute`, and the pause after a
+backend's 429, so that every replica pauses. Give every replica the full limits
+of your account instead of 1/N of them. Without `[cluster]`, the gateway never
+contacts Redis and behaves as described above.
+
+```toml
+[cluster]
+redis_url_env = "REDIS_URL"
+expected_replicas = 3
+```
+
+- Put the Redis URL, which can carry a password, in a Secret and expose it as
+  the environment variable that `redis_url_env` names.
+- Redis 5 or later, or Valkey, as one endpoint and without TLS: Redis Cluster
+  and Sentinel are not supported. One Redis can serve several gateways: set a
+  different `key_prefix` for each.
+- Every booking is one round trip to Redis. A call makes a handful: one for a
+  service with a rate of its own, one when its batch opens, two for the token
+  budget (the booking, then its correction with the real usage) and one before
+  each upstream attempt. A chat backend adds one per extra question. Keep Redis
+  close to the gateway, in the same zone. `redis_timeout_ms` bounds each of
+  them.
+- The limits are kept as GCRA state (two numbers per limit, under
+  `<key_prefix>:backend:<name>:requests`, `:tokens` and
+  `<key_prefix>:service:<name>:requests`), updated by one atomic script that
+  reads Redis's clock, so replicas with drifting clocks still agree. A key
+  expires once its limiter is idle, so Redis keeps nothing for long.
+- These stay per process, because they describe this process: `max_concurrency`
+  (connections to a backend), each service's `max_concurrent`, and merging.
+
+**When Redis is down.** The gateway never fails a call because Redis does. A
+booking that cannot reach Redis within `redis_timeout_ms` is made on this
+replica's own share of the limit instead: the limits divided by
+`expected_replicas`, which defaults to 1, so set it to the number of replicas
+you run or every replica will use the whole limit while Redis is out. The
+gateway logs one warning when an outage starts (not one per call), counts every
+failed booking in `shared_limiter_errors_total`, leaves Redis alone for a
+second before trying again, and logs once more when Redis answers. Shared
+pacing resumes by itself. A pause after a 429 that this replica knows of still
+holds during the outage. Bookings made during an outage are not charged to
+Redis afterwards, so the cluster can briefly go over its limit at the changeover.
+Alert on `rate(systemone_gateway_shared_limiter_errors_total[5m]) > 0`.
+
+**Merging stays per replica.** Only calls that reach the same replica can
+share a batch. To maximise merging, send calls about the same state to the
+same replica, with consistent hashing in the load balancer on a header that
+identifies the state. The gateway ignores the header, so your services can
+send whatever names the document or the case, as long as every service sends
+the same value for the same state. For example, with `x-document-id`:
+
+```yaml
+# ingress-nginx, on the Ingress
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/upstream-hash-by: "$http_x_document_id"
+---
+# Istio
+kind: DestinationRule
+spec:
+  trafficPolicy:
+    loadBalancer:
+      consistentHash:
+        httpHeaderName: x-document-id
+```
+
+Hashing keeps a state on one replica while the set of replicas is stable.
+When replicas come and go, some states move, and a state that is asked about
+very often loads one replica more than the others.
 
 ## Logs
 
@@ -109,6 +183,8 @@ and timings.
 | warn | `circuit breaker opened: the backend failed every call lately` | A backend failed `circuit_breaker_failures` calls in a row. Its calls go to its fallbacks, or get a 503, for `cooldown_ms`. |
 | warn | `circuit breaker opened again: the trial call failed` | The trial call after a cool-down failed. |
 | info | `circuit breaker closed: the trial call was answered` | The backend answered the trial call. |
+| warn | `the shared rate limiter's Redis does not answer; every replica paces with its own share of the limits until it does` | The first booking of an outage that could not reach Redis, with the `reason`. Logged once per outage, not per call. Only with `[cluster]`. |
+| info | `the shared rate limiter's Redis answers again; pacing is shared again` | The end of that outage. |
 | error | `the backend refused the gateway's API key` | A backend answered 401. Fix the key: every call to that backend fails with a 502 until you do. |
 | error | `the answer could not be split` | A backend's response was unreadable or had no answer for a question. |
 | debug | `upstream call answered` | One per upstream call, with the callers and questions it carried. |
@@ -176,6 +252,12 @@ A call answered from the cache is still a call: it shows up in `calls_total`,
 `input_tokens_total`, `upstream_calls_total` or the merging metrics, because
 nothing went upstream.
 
+### Shared limiter
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `shared_limiter_errors_total` | counter | Bookings on the shared rate limiter that could not reach Redis within `redis_timeout_ms`, and were paced on this replica's own share instead. Stays at 0 without `[cluster]`. While it grows, the limits are not shared. After a failure, Redis is left alone for a second, so a long outage counts about one error a second per replica, not one per call. |
+
 ### Useful queries
 
 ```promql
@@ -214,7 +296,8 @@ sum by (backend) (rate(systemone_gateway_cache_hits_total[5m]))
 Start from the limits your providers give you, then adjust with the metrics.
 
 **Backend limits.** `requests_per_minute` and `tokens_per_second` should match
-what the account may use, divided by the number of replicas. The defaults
+what the account may use, divided by the number of replicas, or undivided when
+the replicas [share their limits through Redis](#sharing-the-limits-between-replicas). The defaults
 (1200 and 250000) are starting points, and a provider can change its limits
 without notice. If `upstream_calls_total{status="429"}` keeps growing, the
 limit is set too high: lower that backend's `requests_per_minute`. The gateway
@@ -302,8 +385,13 @@ SDK timeout (10 s by default, in the caller)
 
 ## Known limits
 
-- **Per process.** Pacing, quotas and merging live in memory. See
-  [Kubernetes](#kubernetes) for running several replicas.
+- **Per process.** Merging, `max_concurrency` and each service's
+  `max_concurrent` live in memory, and pacing does too unless you configure
+  `[cluster]`. See [Kubernetes](#kubernetes) for running several replicas.
+- **Shared pacing is best effort.** It needs Redis 5 or later (or Valkey)
+  as a single endpoint without TLS, and costs a round trip per booking. While Redis is unreachable,
+  each replica paces on its own share (`expected_replicas`), and the bookings it
+  makes then are not charged to Redis afterwards.
 - **Chat backends approximate System One.** See the
   [limits of chat backends](backends.md#limits-compared-to-a-system-one-backend).
 - **Token counts are estimates.** Jev's tokenizer is not published, so the

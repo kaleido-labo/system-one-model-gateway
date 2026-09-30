@@ -12,7 +12,7 @@ use tokio::time::{Instant, sleep_until};
 use tracing::warn;
 
 use crate::metrics::{Metrics, UpstreamLabels};
-use crate::scheduling::Gcra;
+use crate::scheduling::Limiter;
 
 mod reply;
 mod retry;
@@ -52,7 +52,7 @@ pub struct Upstream {
     api_key: Option<ApiKey>,
     retry: RetryPolicy,
     /// The shared request pacer, paused here when the vendor answers 429.
-    pacer: Arc<Gcra>,
+    pacer: Arc<Limiter>,
     metrics: Arc<Metrics>,
 }
 
@@ -63,7 +63,7 @@ impl Upstream {
         api_key: Option<ApiKey>,
         connect_timeout: Duration,
         retry: RetryPolicy,
-        pacer: Arc<Gcra>,
+        pacer: Arc<Limiter>,
         metrics: Arc<Metrics>,
     ) -> anyhow::Result<Self> {
         let mut base = reqwest::Url::parse(base_url)?;
@@ -89,7 +89,7 @@ impl Upstream {
     }
 
     /// The backend's request pacer.
-    pub fn pacer(&self) -> &Arc<Gcra> {
+    pub fn pacer(&self) -> &Arc<Limiter> {
         &self.pacer
     }
 
@@ -130,15 +130,15 @@ impl Upstream {
         let mut last_failure = None;
         let result = loop {
             let now = Instant::now();
-            if self.pacer.resume_at(now).is_some() {
+            if self.pacer.resume_at(now).await.is_some() {
                 // This attempt's slot fell inside a pause the backend asked for.
                 // Waking up at the end of the pause would send every held
                 // batch at the same instant, so take a fresh slot after it,
                 // spaced like any other booking, then look again in case the
                 // pause got longer meanwhile.
-                let slot = self.pacer.book(now, 1);
+                let slot = self.pacer.book(now, 1).await;
                 if slot >= deadline {
-                    self.pacer.adjust(-1);
+                    self.pacer.adjust(-1).await;
                     break Err(last_failure.unwrap_or(UpstreamFailure::Paused {
                         retry_after: slot.saturating_duration_since(now),
                     }));
@@ -171,7 +171,7 @@ impl Upstream {
                 && *status == StatusCode::TOO_MANY_REQUESTS
             {
                 // Everyone is over the vendor's limit, not just this call.
-                self.pacer.pause_until(Instant::now() + delay);
+                self.pacer.pause_until(Instant::now() + delay).await;
             }
             if attempt >= self.retry.max_retries {
                 break Err(failure);
@@ -179,9 +179,9 @@ impl Upstream {
             // A retry is one more request against the account's limit, so it
             // takes a slot like any other call.
             let now = Instant::now();
-            let retry_at = self.pacer.book(now, 1).max(now + delay);
+            let retry_at = self.pacer.book(now, 1).await.max(now + delay);
             if retry_at >= deadline {
-                self.pacer.adjust(-1);
+                self.pacer.adjust(-1).await;
                 break Err(failure);
             }
             warn!(

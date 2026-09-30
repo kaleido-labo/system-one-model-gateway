@@ -15,7 +15,7 @@ use crate::backend::{CircuitBreaker, Engine, UpstreamFailure, Verdict, describe}
 use crate::error::GatewayError;
 use crate::metrics::Metrics;
 use crate::scheduling::batch::{Plan, SplitError};
-use crate::scheduling::limiter::Gcra;
+use crate::scheduling::limiter::Limiter;
 use crate::wire::{PreparedRequest, input_tokens};
 
 /// Shortest retry-after the gateway suggests when it sheds a call.
@@ -125,9 +125,9 @@ pub struct Dispatcher {
     backend: String,
     engine: Engine,
     /// Upstream requests per minute, shared by every service.
-    pacer: Arc<Gcra>,
+    pacer: Arc<Limiter>,
     /// Upstream tokens per second, booked on estimates.
-    token_pacer: Gcra,
+    token_pacer: Limiter,
     /// Upstream calls in flight. Tokio's semaphore is fair, so batches go
     /// out in the order they became ready.
     permits: Arc<Semaphore>,
@@ -140,8 +140,8 @@ impl Dispatcher {
     pub fn new(
         backend: &str,
         engine: Engine,
-        pacer: Arc<Gcra>,
-        token_pacer: Gcra,
+        pacer: Arc<Limiter>,
+        token_pacer: Limiter,
         max_concurrency: usize,
         metrics: Arc<Metrics>,
     ) -> Self {
@@ -162,7 +162,7 @@ impl Dispatcher {
         self
     }
 
-    pub fn pacer(&self) -> &Gcra {
+    pub fn pacer(&self) -> &Limiter {
         &self.pacer
     }
 
@@ -196,7 +196,7 @@ impl Dispatcher {
         if live.is_empty() {
             // Nobody is left to answer: hand the request slot this batch
             // booked back to the others.
-            self.pacer.adjust(-1);
+            self.pacer.adjust(-1).await;
             return;
         }
         let mut plan = Plan::new(&live.iter().map(|m| &m.request).collect::<Vec<_>>());
@@ -210,14 +210,18 @@ impl Dispatcher {
             .map(|m| m.latest_send)
             .max()
             .expect("at least one live member");
-        let start = match self.token_pacer.try_book(
-            now,
-            u64::from(plan.estimated_tokens),
-            most_patient.saturating_duration_since(now),
-        ) {
+        let start = match self
+            .token_pacer
+            .try_book(
+                now,
+                u64::from(plan.estimated_tokens),
+                most_patient.saturating_duration_since(now),
+            )
+            .await
+        {
             Ok(start) => start,
             Err(wait) => {
-                self.pacer.adjust(-1);
+                self.pacer.adjust(-1).await;
                 let outcome = Outcome::Failed(GatewayError::rate_limited(
                     "the shared tokens_per_second budget is spent for now",
                     wait.max(MIN_RETRY_AFTER),
@@ -243,7 +247,8 @@ impl Dispatcher {
                 }
                 let smaller = Plan::new(&patient.iter().map(|m| &m.request).collect::<Vec<_>>());
                 self.token_pacer
-                    .adjust(i64::from(smaller.estimated_tokens) - i64::from(plan.estimated_tokens));
+                    .adjust(i64::from(smaller.estimated_tokens) - i64::from(plan.estimated_tokens))
+                    .await;
                 plan = smaller;
             }
             live = patient;
@@ -296,7 +301,8 @@ impl Dispatcher {
                 if let Some(actual) = input_tokens(&reply.body) {
                     let actual = i64::try_from(actual).unwrap_or(i64::MAX);
                     self.token_pacer
-                        .adjust(actual - i64::from(plan.estimated_tokens));
+                        .adjust(actual - i64::from(plan.estimated_tokens))
+                        .await;
                 }
                 debug!(
                     backend = %self.backend,
@@ -389,9 +395,9 @@ impl Dispatcher {
             // the wait for a slot and a connection.
             member.latest_send = member.deadline;
             let now = Instant::now();
-            let start = self.pacer.book(now, 1);
+            let start = self.pacer.book(now, 1).await;
             if start >= member.deadline {
-                self.pacer.adjust(-1);
+                self.pacer.adjust(-1).await;
                 let _ = member
                     .reply
                     .send(Outcome::Failed(GatewayError::rate_limited(
@@ -403,7 +409,7 @@ impl Dispatcher {
             sleep_until(start).await;
             let Ok(permit) = timeout_at(member.deadline, self.acquire()).await else {
                 // The handler has answered 504 by now.
-                self.pacer.adjust(-1);
+                self.pacer.adjust(-1).await;
                 return;
             };
             self.dispatch(vec![member], permit, start).await;

@@ -23,6 +23,7 @@ hex = "0.4"
 httpdate = "1"
 indexmap = { version = "2.14", features = ["serde"] }
 prometheus-client = "0.25"
+redis = { version = "1.7", default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
 reqwest = "0.13.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
@@ -35,4 +36,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
 
 [dev-dependencies]
-tokio = { version = "1.53", features = ["test-util"] }
+tokio = { version = "1.53", features = ["test-util", "io-util"] }

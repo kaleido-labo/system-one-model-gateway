@@ -63,6 +63,7 @@ pub struct Metrics {
     pub deduplicated_questions: Family<BackendLabels, Counter>,
     pub estimated_tokens_saved: Family<BackendLabels, Counter>,
     pub isolated_replays: Family<BackendLabels, Counter>,
+    pub shared_limiter_errors: Counter,
     pub queue_wait: HistogramFamily<BackendLabels>,
     pub cache_hits: Family<BackendLabels, Counter>,
     pub cache_misses: Family<BackendLabels, Counter>,
@@ -174,6 +175,12 @@ impl Metrics {
             "Calls replayed on their own after the merged call they were in was rejected, by backend",
             isolated_replays.clone(),
         );
+        let shared_limiter_errors = Counter::default();
+        registry.register(
+            "shared_limiter_errors",
+            "Bookings on the shared rate limiter that failed because Redis was unreachable or too slow; each was paced on the replica's own share instead",
+            shared_limiter_errors.clone(),
+        );
         let queue_wait: HistogramFamily<BackendLabels> =
             Family::new_with_constructor(latency_histogram);
         registry.register(
@@ -216,6 +223,7 @@ impl Metrics {
             deduplicated_questions,
             estimated_tokens_saved,
             isolated_replays,
+            shared_limiter_errors,
             queue_wait,
             cache_hits,
             cache_misses,

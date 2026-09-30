@@ -26,7 +26,7 @@ use tokio::time::{Instant, sleep_until};
 use crate::config::{BackendConfig, Config, ModelPattern, Protocol, best_match, millis, parse_all};
 use crate::error::GatewayError;
 use crate::metrics::Metrics;
-use crate::scheduling::{BatchLimits, Coalescer, Dispatcher, Gcra, Outcome};
+use crate::scheduling::{BatchLimits, Coalescer, Dispatcher, Limiters, Outcome};
 use crate::wire::{Invalid, PreparedRequest};
 
 mod breaker;
@@ -74,6 +74,7 @@ impl Backend {
         config: &BackendConfig,
         coalescing: &crate::config::CoalescingConfig,
         env: &dyn Fn(&str) -> Option<String>,
+        limiters: &Limiters,
         metrics: &Arc<Metrics>,
     ) -> anyhow::Result<Self> {
         let name = &config.name;
@@ -89,7 +90,8 @@ impl Backend {
             }
             None => None,
         };
-        let pacer = Arc::new(Gcra::per_minute(
+        let pacer = Arc::new(limiters.per_minute(
+            &format!("backend:{name}:requests"),
             f64::from(config.requests_per_minute),
             u64::from(config.burst()),
         ));
@@ -161,7 +163,11 @@ impl Backend {
                 name,
                 engine,
                 pacer,
-                Gcra::per_second(tokens_per_second as f64, tokens_per_second),
+                limiters.per_second(
+                    &format!("backend:{name}:tokens"),
+                    tokens_per_second as f64,
+                    tokens_per_second,
+                ),
                 config.max_concurrency,
                 Arc::clone(metrics),
             )
@@ -212,6 +218,7 @@ impl Backend {
             .upstream
             .pacer()
             .try_book(now, 1, self.max_queue_wait)
+            .await
             .map_err(|retry_after| {
                 Outcome::Failed(GatewayError::rate_limited(
                     format!("backend {:?} is fully booked", self.name),
@@ -250,12 +257,13 @@ impl Backends {
     pub fn build(
         config: &Config,
         env: &dyn Fn(&str) -> Option<String>,
+        limiters: &Limiters,
         metrics: &Arc<Metrics>,
     ) -> anyhow::Result<Self> {
         let backends: Vec<Backend> = config
             .backends
             .iter()
-            .map(|backend| Backend::build(backend, &config.coalescing, env, metrics))
+            .map(|backend| Backend::build(backend, &config.coalescing, env, limiters, metrics))
             .collect::<anyhow::Result<_>>()?;
         for backend in &backends {
             for other in &backend.fallback {
@@ -324,6 +332,7 @@ mod tests {
         Backends::build(
             &config,
             &|_| Some("key".to_owned()),
+            &Limiters::local(),
             &Arc::new(Metrics::new()),
         )
         .unwrap()
@@ -373,9 +382,14 @@ mod tests {
             "0".repeat(64)
         ))
         .unwrap();
-        let err = Backends::build(&config, &|_| None, &Arc::new(Metrics::new()))
-            .err()
-            .unwrap();
+        let err = Backends::build(
+            &config,
+            &|_| None,
+            &Limiters::local(),
+            &Arc::new(Metrics::new()),
+        )
+        .err()
+        .unwrap();
         assert!(err.to_string().contains("HF_TOKEN"), "{err}");
         // No api_key_env: no key needed.
         let config = Config::from_toml(&format!(
@@ -384,7 +398,15 @@ mod tests {
             "0".repeat(64)
         ))
         .unwrap();
-        assert!(Backends::build(&config, &|_| None, &Arc::new(Metrics::new())).is_ok());
+        assert!(
+            Backends::build(
+                &config,
+                &|_| None,
+                &Limiters::local(),
+                &Arc::new(Metrics::new())
+            )
+            .is_ok()
+        );
     }
 
     #[test]

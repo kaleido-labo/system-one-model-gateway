@@ -1,9 +1,11 @@
 //! Gateway configuration, read from a TOML file: the server, the merge window,
-//! the backends (`backend`) and the services allowed to call the gateway.
+//! the backends (`backend`), the services allowed to call the gateway and,
+//! optionally, the Redis that replicas share their pacing through.
 //!
 //! The file holds no secret: services are identified by the SHA-256 of their
-//! key, and each backend's key is read from the environment variable the
-//! file names. The file can live in git or in a Kubernetes ConfigMap.
+//! key, and each backend's key and the Redis URL are read from the
+//! environment variables the file names. The file can live in git or in a
+//! Kubernetes ConfigMap.
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -14,9 +16,11 @@ use anyhow::{Context, bail, ensure};
 use serde::Deserialize;
 
 mod backend;
+mod cluster;
 mod pattern;
 
 pub use backend::{BackendConfig, Protocol};
+pub use cluster::ClusterConfig;
 pub use pattern::{ModelPattern, best_match, parse_all};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -36,6 +40,9 @@ pub struct Config {
     pub cache: CacheConfig,
     #[serde(default, rename = "service")]
     pub services: Vec<ServiceConfig>,
+    /// Present only when replicas share their pacing through Redis.
+    #[serde(default)]
+    pub cluster: Option<ClusterConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -265,6 +272,9 @@ impl Config {
             self.cache.max_entries > 0,
             "cache.max_entries must be positive"
         );
+        if let Some(cluster) = &self.cluster {
+            cluster.validate()?;
+        }
 
         if self.services.is_empty() {
             bail!("no [[service]] configured: nobody could call the gateway");
@@ -519,6 +529,50 @@ mod tests {
         assert!(error_of("[cache]\nttl_ms = 0").contains("cache.ttl_ms"));
         assert!(error_of("[cache]\nmax_entries = 0").contains("cache.max_entries"));
         assert!(error_of("[cache]\nttl = 5").contains("unknown field"));
+    }
+
+    #[test]
+    fn without_a_cluster_table_pacing_stays_in_memory() {
+        let config = Config::from_toml(&with_service("")).unwrap();
+        assert!(config.cluster.is_none());
+    }
+
+    #[test]
+    fn a_cluster_table_needs_only_the_variable_holding_the_redis_url() {
+        let config = Config::from_toml(&format!(
+            "[cluster]\nredis_url_env = \"REDIS_URL\"\n{}",
+            with_service("")
+        ))
+        .unwrap();
+        let cluster = config.cluster.unwrap();
+        assert_eq!(cluster.redis_url_env, "REDIS_URL");
+        assert_eq!(cluster.key_prefix, "systemone-gateway");
+        assert_eq!(cluster.redis_timeout_ms, 200);
+        assert_eq!(cluster.expected_replicas, 1);
+
+        let config = Config::from_toml(&format!(
+            "[cluster]\nredis_url_env = \"R\"\nkey_prefix = \"prod:gw\"\n\
+             redis_timeout_ms = 50\nexpected_replicas = 4\n{}",
+            with_service("")
+        ))
+        .unwrap();
+        let cluster = config.cluster.unwrap();
+        assert_eq!(cluster.key_prefix, "prod:gw");
+        assert_eq!(cluster.redis_timeout_ms, 50);
+        assert_eq!(cluster.expected_replicas, 4);
+    }
+
+    #[test]
+    fn rejects_cluster_settings_that_cannot_work() {
+        assert!(error_of("[cluster]").contains("redis_url_env"));
+        assert!(error_of("[cluster]\nredis_url_env = \"\"").contains("redis_url_env"));
+        let cluster = |extra: &str| error_of(&format!("[cluster]\nredis_url_env = \"R\"\n{extra}"));
+        assert!(cluster("key_prefix = \"\"").contains("key_prefix"));
+        assert!(cluster("key_prefix = \"a b\"").contains("key_prefix"));
+        assert!(cluster("redis_timeout_ms = 0").contains("redis_timeout_ms"));
+        assert!(cluster("expected_replicas = 0").contains("expected_replicas"));
+        // A typo must not be ignored.
+        assert!(cluster("redis_url = \"redis://x\"").contains("unknown field"));
     }
 
     fn error_of(toml: &str) -> String {

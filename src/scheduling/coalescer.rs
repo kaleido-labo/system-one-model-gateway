@@ -39,6 +39,13 @@ pub struct Coalescer {
     dispatcher: Arc<Dispatcher>,
 }
 
+/// How far `submit` got without waiting for the pacer.
+enum InProcess {
+    Done(Result<(), Saturated>),
+    /// No batch to join, and the slot for a new one is booked through Redis.
+    NeedsSlot(Member),
+}
+
 struct Batch {
     key: BatchKey,
     opened: Instant,
@@ -60,7 +67,7 @@ impl Coalescer {
     }
 
     /// Queues a call that arrived at `arrived`. Its outcome is sent on `reply`.
-    pub fn submit(
+    pub async fn submit(
         self: &Arc<Self>,
         request: PreparedRequest,
         arrived: Instant,
@@ -77,26 +84,90 @@ impl Coalescer {
             deadline,
             reply,
         };
-        // Lock order: the open map, then a batch's members, then the pacer.
-        // `run` and `shed_expired` take them in the same order.
-        let mut open = lock(&self.open);
-        if let Some(batch) = open.get(&member.request.key) {
-            let mut members = lock(&batch.members);
-            if !members.sealed
-                && batch.send_at <= latest_send
-                && members.fits(&member.request, &self.limits)
-            {
-                members.add(member);
-                return Ok(());
-            }
-        }
+        let member = match self.submit_in_process(member, now) {
+            InProcess::Done(result) => return result,
+            InProcess::NeedsSlot(member) => member,
+        };
 
-        // A new batch needs its own upstream slot, early enough for this call.
+        // The slot is booked through Redis, which must not happen under the
+        // lock: a call that finds no batch to join asks for its slot first.
         let slot = self
             .dispatcher
             .pacer()
             .try_book(now, 1, latest_send.saturating_duration_since(now))
+            .await
             .map_err(|retry_after| Saturated { retry_after })?;
+        // A call for the same state may have opened a batch while this one
+        // was waiting for Redis. Better to join it than to open a second
+        // batch for the same state, so the slot goes back.
+        if self.join_or_open(member, slot, now) {
+            self.dispatcher.pacer().adjust(-1).await;
+        }
+        Ok(())
+    }
+
+    /// The part of `submit` that needs no await: joining an open batch, and
+    /// opening one when the pacer lives in this process. All of it happens
+    /// under one lock, so two calls for the same state never both open a
+    /// batch.
+    fn submit_in_process(self: &Arc<Self>, member: Member, now: Instant) -> InProcess {
+        // Lock order: the open map, then a batch's members, then the pacer.
+        // `run` and `shed_expired` take them in the same order.
+        let open = lock(&self.open);
+        let Some(member) = self.join(&open, member) else {
+            return InProcess::Done(Ok(()));
+        };
+
+        // A new batch needs its own upstream slot, early enough for this call.
+        let wait = member.latest_send.saturating_duration_since(now);
+        match self.dispatcher.pacer().try_book_in_process(now, 1, wait) {
+            Some(Ok(slot)) => {
+                self.open_batch(open, member, slot, now);
+                InProcess::Done(Ok(()))
+            }
+            Some(Err(retry_after)) => InProcess::Done(Err(Saturated { retry_after })),
+            None => InProcess::NeedsSlot(member),
+        }
+    }
+
+    /// Puts a call that holds a fresh slot into an open batch that has
+    /// appeared meanwhile, if any, and otherwise opens a batch on the slot.
+    /// True when the call joined, which leaves the slot unused.
+    fn join_or_open(self: &Arc<Self>, member: Member, slot: Instant, now: Instant) -> bool {
+        let open = lock(&self.open);
+        match self.join(&open, member) {
+            None => true,
+            Some(member) => {
+                self.open_batch(open, member, slot, now);
+                false
+            }
+        }
+    }
+
+    /// Adds the call to the open batch for its state, if that batch can
+    /// still take it. Otherwise hands the call back.
+    fn join(&self, open: &HashMap<BatchKey, Arc<Batch>>, member: Member) -> Option<Member> {
+        if let Some(batch) = open.get(&member.request.key) {
+            let mut members = lock(&batch.members);
+            if !members.sealed
+                && batch.send_at <= member.latest_send
+                && members.fits(&member.request, &self.limits)
+            {
+                members.add(member);
+                return None;
+            }
+        }
+        Some(member)
+    }
+
+    /// Opens a batch for the call, to leave when `slot` is reached.
+    fn open_batch(
+        self: &Arc<Self>,
+        mut open: MutexGuard<'_, HashMap<BatchKey, Arc<Batch>>>,
+        member: Member,
+        slot: Instant,
+        now: Instant,
+    ) {
         let mut members = Members::new(member.request.state_tokens);
         let key = member.request.key;
         members.add(member);
@@ -113,7 +184,6 @@ impl Coalescer {
         }
         drop(open);
         tokio::spawn(Arc::clone(self).run(batch));
-        Ok(())
     }
 
     async fn run(self: Arc<Self>, batch: Arc<Batch>) {
@@ -135,9 +205,9 @@ impl Coalescer {
                 biased;
                 permit = &mut acquire => break permit,
                 () = sleep_until(expiry) => {
-                    if self.shed_expired(&batch, Instant::now()) {
+                    if self.shed_expired(&batch, Instant::now()).await {
                         // Nobody is left: hand the request slot back.
-                        self.dispatcher.pacer().adjust(-1);
+                        self.dispatcher.pacer().adjust(-1).await;
                         return;
                     }
                 }
@@ -161,12 +231,19 @@ impl Coalescer {
 
     /// Answers 429 to the callers of `batch` whose latest send time has
     /// passed. Returns true if that emptied the batch, which is then closed.
-    fn shed_expired(&self, batch: &Arc<Batch>, now: Instant) -> bool {
+    async fn shed_expired(&self, batch: &Arc<Batch>, now: Instant) -> bool {
+        // Asked before taking the locks, because with a shared pacer it is a
+        // round trip to Redis.
+        let retry_after = self
+            .dispatcher
+            .pacer()
+            .backlog(now)
+            .await
+            .max(MIN_RETRY_AFTER);
         let mut open = lock(&self.open);
         let mut members = lock(&batch.members);
         let expired = members.take_expired(now);
         if !expired.is_empty() {
-            let retry_after = self.dispatcher.pacer().backlog(now).max(MIN_RETRY_AFTER);
             let outcome = Outcome::Failed(GatewayError::rate_limited(
                 "every upstream connection stayed busy past max_queue_wait_ms",
                 retry_after,
@@ -208,7 +285,7 @@ mod tests {
     use super::*;
     use crate::backend::{ApiKey, Engine, RetryPolicy, Upstream};
     use crate::metrics::Metrics;
-    use crate::scheduling::limiter::Gcra;
+    use crate::scheduling::limiter::{Gcra, Limiter};
     use crate::wire::TokenEstimator;
     use serde_json::json;
 
@@ -241,7 +318,7 @@ mod tests {
 
     /// Submits a call arriving now; keep the receiver alive or the call
     /// counts as abandoned.
-    fn submit(
+    async fn submit(
         coalescer: &Arc<Coalescer>,
         request: PreparedRequest,
     ) -> Result<oneshot::Receiver<Outcome>, Saturated> {
@@ -249,12 +326,13 @@ mod tests {
         let now = Instant::now();
         coalescer
             .submit(request, now, now + Duration::from_secs(2), reply)
+            .await
             .map(|()| answer)
     }
 
     fn coalescer(limits: BatchLimits, upstream_rpm: f64) -> Arc<Coalescer> {
         let metrics = Arc::new(Metrics::new());
-        let pacer = Arc::new(Gcra::per_minute(upstream_rpm, 1));
+        let pacer = Arc::new(Limiter::Local(Gcra::per_minute(upstream_rpm, 1)));
         // Nothing listens on port 9; the batches below are never sent.
         let upstream = Upstream::new(
             "test",
@@ -280,7 +358,7 @@ mod tests {
             "test",
             engine,
             pacer,
-            Gcra::per_second(1_000_000.0, 1_000_000),
+            Limiter::Local(Gcra::per_second(1_000_000.0, 1_000_000)),
             4,
             metrics,
         );
@@ -321,9 +399,15 @@ mod tests {
     #[tokio::test]
     async fn calls_with_the_same_state_join_one_open_batch() {
         let coalescer = coalescer(limits(), 60_000.0);
-        let _a = submit(&coalescer, request("same", json!({"a": noul("A")}))).unwrap();
-        let _b = submit(&coalescer, request("same", json!({"b": noul("B")}))).unwrap();
-        let _c = submit(&coalescer, request("other", json!({"c": noul("C")}))).unwrap();
+        let _a = submit(&coalescer, request("same", json!({"a": noul("A")})))
+            .await
+            .unwrap();
+        let _b = submit(&coalescer, request("same", json!({"b": noul("B")})))
+            .await
+            .unwrap();
+        let _c = submit(&coalescer, request("other", json!({"c": noul("C")})))
+            .await
+            .unwrap();
         assert_eq!(coalescer.open_batches(), 2);
         let open = lock(&coalescer.open);
         let calls: Vec<usize> = open
@@ -338,8 +422,10 @@ mod tests {
     async fn a_full_batch_is_replaced_by_a_new_one() {
         let coalescer = coalescer(limits(), 60_000.0);
         let full = request("s", json!({"a": noul("A"), "b": noul("B"), "c": noul("C")}));
-        let _a = submit(&coalescer, full).unwrap();
-        let _b = submit(&coalescer, request("s", json!({"d": noul("D")}))).unwrap();
+        let _a = submit(&coalescer, full).await.unwrap();
+        let _b = submit(&coalescer, request("s", json!({"d": noul("D")})))
+            .await
+            .unwrap();
         let open = lock(&coalescer.open);
         assert_eq!(open.len(), 1);
         let batch = open.values().next().unwrap();
@@ -357,14 +443,20 @@ mod tests {
             },
             60.0,
         );
-        let _a = submit(&coalescer, request("first", json!({"a": noul("A")}))).unwrap();
-        let refused = submit(&coalescer, request("second", json!({"b": noul("B")}))).unwrap_err();
+        let _a = submit(&coalescer, request("first", json!({"a": noul("A")})))
+            .await
+            .unwrap();
+        let refused = submit(&coalescer, request("second", json!({"b": noul("B")})))
+            .await
+            .unwrap_err();
         assert!(
             refused.retry_after > Duration::from_millis(900),
             "{refused:?}"
         );
         // Joining an open batch needs no slot, so it still works.
-        let _c = submit(&coalescer, request("first", json!({"c": noul("C")}))).unwrap();
+        let _c = submit(&coalescer, request("first", json!({"c": noul("C")})))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -376,8 +468,12 @@ mod tests {
             },
             60_000.0,
         );
-        let _a = submit(&coalescer, request("same", json!({"a": noul("A")}))).unwrap();
-        let _b = submit(&coalescer, request("same", json!({"b": noul("B")}))).unwrap();
+        let _a = submit(&coalescer, request("same", json!({"a": noul("A")})))
+            .await
+            .unwrap();
+        let _b = submit(&coalescer, request("same", json!({"b": noul("B")})))
+            .await
+            .unwrap();
         assert_eq!(coalescer.open_batches(), 0);
     }
 }

@@ -15,6 +15,7 @@ use crate::cache::AnswerCache;
 use crate::config::{Config, millis};
 use crate::http::{AdminToken, AppState, Shared, admin_router, public_router};
 use crate::metrics::Metrics;
+use crate::scheduling::Limiters;
 use crate::services::ServiceRegistry;
 use crate::wire::TokenEstimator;
 
@@ -116,9 +117,10 @@ fn build_state(config: &Config, env: &dyn Fn(&str) -> Option<String>) -> anyhow:
         .cache
         .enabled
         .then(|| AnswerCache::new(&config.cache, metrics.cache_entries.clone()));
+    let limiters = Limiters::from_config(config.cluster.as_ref(), env, &metrics)?;
     Ok(AppState::new(Shared {
-        registry: ServiceRegistry::from_config(&config.services),
-        backends: Backends::build(config, env, &metrics)?,
+        registry: ServiceRegistry::from_config(&config.services, &limiters),
+        backends: Backends::build(config, env, &limiters, &metrics)?,
         metrics,
         estimator: TokenEstimator::new(config.coalescing.bytes_per_token),
         cache,

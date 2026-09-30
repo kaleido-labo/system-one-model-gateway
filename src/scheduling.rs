@@ -11,7 +11,8 @@
 //!   several calls into one body and splits the answer back into one response
 //!   per call, with each caller's share of the token usage.
 //!
-//! `limiter` holds the pacing all of them book against.
+//! `limiter` holds the pacing all of them book against, in memory or shared
+//! between replicas through Redis.
 
 mod batch;
 mod coalescer;
@@ -20,4 +21,4 @@ mod limiter;
 
 pub use coalescer::{BatchLimits, Coalescer, Saturated};
 pub use dispatch::{Dispatcher, MIN_RETRY_AFTER, Outcome};
-pub use limiter::Gcra;
+pub use limiter::{Limiter, Limiters};

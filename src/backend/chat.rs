@@ -135,10 +135,12 @@ impl ChatEngine {
         let now = Instant::now();
         let pacer = self.upstream.pacer();
         let mut slots = vec![now];
-        slots.extend((1..prompts.len()).map(|_| pacer.book(now, 1)));
+        for _ in 1..prompts.len() {
+            slots.push(pacer.book(now, 1).await);
+        }
         let last = *slots.last().expect("a request has at least one question");
         if last >= deadline {
-            pacer.adjust(1 - prompts.len() as i64);
+            pacer.adjust(1 - prompts.len() as i64).await;
             return Err(UpstreamFailure::Paused {
                 retry_after: last.saturating_duration_since(now),
             });
