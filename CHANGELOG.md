@@ -29,6 +29,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   batch and upstream attempt.
 - An optional bearer token for the admin port's `/metrics`
   (`server.admin_token_env`).
+- An opt-in adaptive request rate per backend (`adaptive_rate`): a 429
+  lowers the backend's `requests_per_minute` once per episode, down to a floor,
+  and quiet periods raise it back to the configured value. The current rate is
+  exported as `requests_per_minute_limit`.
+- Configuration reload without a restart, on `SIGHUP` or when the file content
+  changes (`server.config_reload_interval_ms`). Services, backends, merging,
+  the cache and the request timeout are applied live; unchanged backends keep
+  their queues, pacing and breaker state. An invalid file leaves the running
+  configuration in place.
 
 ### Changed
 

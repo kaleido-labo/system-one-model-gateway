@@ -93,12 +93,12 @@ cargo clippy --all-targets
 | --- | --- |
 | `http/` | Routers, the `POST /v1/systemone` handler and its use of the answer cache, `GET /v1/models`, admin endpoints and the check of the admin token |
 | `wire/` | The System One wire format kept as raw JSON: parsing, merge keys, documented request rules, token estimates |
-| `backend/` | Backends, model routing and fallback chains; the circuit breaker (`breaker`); the HTTP client of one backend with retries (`upstream/`); the `chat` protocol with a prompt per question, answers read from logprobs and errors in TypeSafe's shape (`chat/`) |
-| `scheduling/` | Opens, joins and seals batches (`coalescer`); builds the merged request and splits the answer and token usage (`batch/`); sends a sealed batch and replays after a rejection (`dispatch`); GCRA pacing, in process or shared through Redis (`limiter/`) |
+| `backend/` | Backends, model routing and fallback chains; the circuit breaker (`breaker`); the adaptive request rate (`adaptive`); the HTTP client of one backend with retries (`upstream/`); the `chat` protocol with a prompt per question, answers read from logprobs and errors in TypeSafe's shape (`chat/`) |
+| `scheduling/` | Opens, joins and seals batches (`coalescer`); builds the merged request and splits the answer and token usage (`batch/`); sends a sealed batch and replays after a rejection (`dispatch`); GCRA pacing, in process or shared through Redis (`limiter/`); the AIMD rule for an adaptive rate (`aimd`) |
 | `config/` | Configuration root and validation, backend settings, model name patterns, `[cluster]` and `[tracing]` |
 | `cache.rs` | The optional answer cache |
 | `telemetry/` | OpenTelemetry setup, trace context propagation and spans |
-| `services.rs`, `metrics.rs`, `error.rs`, `app.rs` | Keys and quotas, Prometheus, error shape, wiring and shutdown |
+| `services.rs`, `metrics.rs`, `error.rs`, `app.rs` | Keys and quotas, Prometheus, error shape, wiring, configuration reload (`app/reload`) and shutdown |
 
 [CONTRIBUTING.md](CONTRIBUTING.md) covers the build, the lint commands and the pull request conventions.
 
