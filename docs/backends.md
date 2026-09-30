@@ -160,8 +160,15 @@ the model the first chat response reports, or the name sent upstream.
   thinking off: `chat_template_kwargs = { enable_thinking = false }`.
 - **Request fields.** Top-level request fields other than `state`, `model` and
   `questions` are not sent, because a chat API has nowhere to put them.
-- **Error bodies.** When the chat API rejects a request, the caller gets its
-  status and body as sent, in the provider's format and not TypeSafe's.
+- **Error bodies.** When the chat API rejects a request, the caller gets the
+  provider's status and `retry-after` headers, with the body rewritten into
+  TypeSafe's error shape (see [Errors](api.md#errors)). The `message` is the
+  provider's own text, taken from `error.message`, `error` or `message`, and cut
+  to 500 characters. A body that is not JSON, or has none of those, gets
+  "the chat backend answered with status N" instead, so the text of a page or of
+  the prompt never reaches the caller. The provider's `code`, `param` and other
+  fields are dropped. A System One backend's errors are passed through as they
+  are, because they already are TypeSafe's.
 - **All or nothing.** The questions of one call are sent in parallel. If one
   fails, the whole call fails, and the other requests are cancelled.
 

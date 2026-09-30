@@ -94,6 +94,36 @@ impl GatewayError {
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)
     }
+
+    /// An error status that a backend sent and the gateway passes on with
+    /// its own status code, under the `type` this status has in the table
+    /// above. A backend's 500 is `upstream_error`, not `internal_error`:
+    /// `internal_error` means a bug in the gateway.
+    pub fn from_status(status: StatusCode, message: impl Into<String>) -> Self {
+        let kind = match status {
+            StatusCode::FORBIDDEN => "permission_error",
+            StatusCode::NOT_FOUND => "not_found_error",
+            StatusCode::UNPROCESSABLE_ENTITY => "validation_error",
+            StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
+            StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT => "timeout_error",
+            StatusCode::UNAUTHORIZED => "authentication_error",
+            status if status.is_client_error() => "invalid_request_error",
+            _ => "upstream_error",
+        };
+        Self::new(status, kind, message)
+    }
+
+    /// The JSON body of this error.
+    pub fn body(&self) -> String {
+        serde_json::to_string(&Body {
+            error: Detail {
+                kind: self.kind,
+                message: &self.message,
+                param: self.param.as_deref(),
+            },
+        })
+        .expect("the error body always serializes")
+    }
 }
 
 #[derive(Serialize)]
@@ -112,14 +142,7 @@ struct Detail<'a> {
 
 impl IntoResponse for GatewayError {
     fn into_response(self) -> Response {
-        let body = serde_json::to_string(&Body {
-            error: Detail {
-                kind: self.kind,
-                message: &self.message,
-                param: self.param.as_deref(),
-            },
-        })
-        .expect("the error body always serializes");
+        let body = self.body();
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         if let Some(retry_after) = self.retry_after {
@@ -157,6 +180,25 @@ mod tests {
         assert_eq!(body["error"]["type"], "validation_error");
         assert_eq!(body["error"]["param"], "questions.q.criteria");
         assert_eq!(body["error"]["message"], "questions.q.criteria is required");
+    }
+
+    #[test]
+    fn a_backend_status_keeps_its_code_and_gets_the_matching_type() {
+        for (status, kind) in [
+            (400, "invalid_request_error"),
+            (402, "invalid_request_error"),
+            (403, "permission_error"),
+            (404, "not_found_error"),
+            (422, "validation_error"),
+            (429, "rate_limit_error"),
+            (500, "upstream_error"),
+            (503, "upstream_error"),
+            (504, "timeout_error"),
+            (529, "upstream_error"),
+        ] {
+            let error = GatewayError::from_status(StatusCode::from_u16(status).unwrap(), "no");
+            assert_eq!((error.status.as_u16(), error.kind), (status, kind));
+        }
     }
 
     #[tokio::test]

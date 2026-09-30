@@ -171,15 +171,19 @@ A 429 from the gateway has one of these causes, and the `message` says which:
 - the shared `tokens_per_second` budget is spent;
 - the backend asked everyone to back off and its pause outlasts the call.
 
-Two kinds of response do not use this shape:
+When a backend answers an error status that the gateway does not retry (400,
+403, 422...), or keeps answering 429, 500, 502, 503, 504 or 529 until the
+retries run out, the caller gets that status and the backend's `retry-after`
+headers. A backend's 401 is the exception: it means the gateway's key is wrong,
+so the caller gets a 502. The body depends on the protocol:
 
-- **Errors passed through from a backend.** When a backend answers an error
-  status that the gateway does not retry (400, 403, 422...), or keeps answering
-  429, 500, 502, 503, 504 or 529 until the retries run out, the caller gets
-  that status, that body and the backend's `retry-after` headers, as sent. A
-  chat backend's error body is in its own format, not TypeSafe's. A backend's
-  401 is the exception: it means the gateway's key is wrong, so the caller gets
-  a 502.
-- **Errors from the HTTP layer.** A body larger than `server.max_body_bytes`
-  gets a `413` with a plain-text body, and a wrong method on a known route
-  gets a `405` with an empty body. Both are sent before authentication.
+- **A System One backend**: the body as sent, because it already is TypeSafe's.
+- **A chat backend**: a body in the shape above. The `type` follows the status
+  as in the table (a provider's 500 or 503 is `upstream_error`), and the
+  `message` is the provider's own text when its body has one, see
+  [Backends](backends.md#limits-compared-to-a-system-one-backend).
+
+Errors from the HTTP layer do not use this shape. A body larger than
+`server.max_body_bytes` gets a `413` with a plain-text body, and a wrong method
+on a known route gets a `405` with an empty body. Both are sent before
+authentication.

@@ -46,7 +46,9 @@ pub enum Outcome {
     },
     /// An error the gateway answers itself.
     Failed(GatewayError),
-    /// An error status from the backend, handed back as it was sent.
+    /// An error status from the backend, handed back with its body as the
+    /// engine left it: as sent by a System One backend, already rewritten
+    /// into the gateway's error shape by a chat backend.
     Rejected {
         status: StatusCode,
         body: Bytes,

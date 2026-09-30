@@ -20,6 +20,9 @@
 //!   with prefix caching (vLLM, TGI) reads the shared state once.
 //! - Top-level request fields other than `state`, `model` and `questions`
 //!   have no chat equivalent and are not sent.
+//!
+//! When the chat API rejects a request, its error body is rewritten into
+//! TypeSafe's error shape (see `failure`), so services see one format.
 
 use std::sync::Arc;
 
@@ -35,9 +38,11 @@ use crate::backend::{Upstream, UpstreamFailure, UpstreamReply};
 use crate::wire::{Invalid, ObjectWriter, PreparedRequest};
 
 mod answer;
+mod failure;
 mod prompt;
 
 use answer::ChatResponse;
+use failure::translate;
 use prompt::{MAX_CHOICE_OPTIONS, Prompt, QuestionFields, text_of};
 
 const SYSTEM_PROMPT: &str = "You answer one question about the state the user gives you. \
@@ -156,7 +161,7 @@ impl ChatEngine {
             })?;
             // Returning drops `calls`, which cancels the other questions:
             // their answers could not be used anyway.
-            replies[index] = Some(result?);
+            replies[index] = Some(result.map_err(translate)?);
         }
 
         let mut answers = ObjectWriter::with_capacity(256 * prompts.len());
