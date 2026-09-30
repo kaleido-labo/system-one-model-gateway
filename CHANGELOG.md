@@ -14,6 +14,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   code of conduct, editor and rustfmt configuration, and a cargo-deny
   configuration for license and advisory checks.
 - Repository metadata in `Cargo.toml`.
+- A circuit breaker per backend (`circuit_breaker_failures`,
+  `circuit_breaker_cooldown_ms`) and opt-in `fallback` backends. A call whose
+  backend is down goes to the next usable fallback, or gets a fast 503 with
+  `retry-after` when none is left.
+- An opt-in in-memory answer cache (`[cache]`), keyed by model, state, extra
+  fields and question, with a per-backend opt-out, `cache-control: no-cache`
+  and an `x-systemone-gateway-cache` response header.
+- An optional Redis-backed rate limiter (`[cluster]`), so that replicas share
+  each backend's and each service's limits and the pause after a 429. Pacing
+  falls back to a per-replica share while Redis is unreachable.
+- Opt-in OpenTelemetry traces over OTLP/HTTP (`[tracing]`), with W3C
+  `traceparent` propagation from callers to backends and one span per call,
+  batch and upstream attempt.
+- An optional bearer token for the admin port's `/metrics`
+  (`server.admin_token_env`).
+
+### Changed
+
+- Errors from chat backends now reach the caller in TypeSafe's error shape,
+  with the provider's status kept.
+- The merging metrics (`batch_callers`, `batch_questions`,
+  `queue_wait_seconds`, `deduplicated_questions_total`,
+  `estimated_tokens_saved_total`, `isolated_replays_total`) carry a `backend`
+  label. Queries that read them without one need a `sum by`.
 
 ## [0.1.0]
 
