@@ -12,6 +12,8 @@ use reqwest::StatusCode;
 use serde_json::Value;
 use systemone_gateway::{Config, Gateway, hash_key};
 
+// Each test binary uses a different part of it.
+#[allow(unused_imports)]
 pub use mock_upstream::{MockUpstream, Scripted};
 
 /// The key the mock expects from the gateway.

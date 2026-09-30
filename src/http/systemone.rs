@@ -1,6 +1,11 @@
 //! `POST /v1/systemone`: authenticates the caller, validates the request,
 //! routes it to a backend, queues it for merging and turns the outcome into
 //! an HTTP response.
+//!
+//! Two spans are open while a call is handled: the log span of the router,
+//! which `Span::current()` is before the trace span is entered, and the trace
+//! span (see `telemetry`). Fields go to each by name, never through
+//! `Span::current()`, which would reach only the innermost.
 
 use std::time::Duration;
 
@@ -10,13 +15,14 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use tokio::sync::oneshot;
 use tokio::time::{Instant, timeout_at};
-use tracing::Span;
+use tracing::{Instrument, Span};
 
-use super::{AppState, BACKEND, Shared, outcome_response};
+use super::{AppState, BACKEND, Shared, outcome_response, request_id};
 use crate::error::GatewayError;
 use crate::metrics::{CallLabels, Metrics};
-use crate::scheduling::Saturated;
+use crate::scheduling::{Outcome, Saturated};
 use crate::services::{Refusal, ServiceId};
+use crate::telemetry;
 use crate::wire::{Invalid, PreparedRequest, RequestError};
 
 pub(super) async fn systemone(
@@ -25,14 +31,24 @@ pub(super) async fn systemone(
     body: Bytes,
 ) -> Response {
     let arrived = Instant::now();
-    let Some(service_id) = state.0.registry.authenticate(&headers) else {
-        record_call(&state.0.metrics, "-", StatusCode::UNAUTHORIZED, arrived);
-        return GatewayError::unauthorized().into_response();
-    };
-    let service = state.0.registry.get(service_id);
-    Span::current().record("service", service.name.as_str());
-    let response = handle_systemone(&state.0, service_id, &body, arrived).await;
-    record_call(&state.0.metrics, &service.name, response.status(), arrived);
+    let log_span = Span::current();
+    let call = telemetry::systemone_call(request_id(&headers));
+    let response = async {
+        let Some(service_id) = state.0.registry.authenticate(&headers) else {
+            record_call(&state.0.metrics, "-", StatusCode::UNAUTHORIZED, arrived);
+            return GatewayError::unauthorized().into_response();
+        };
+        telemetry::adopt_caller(&call, &headers);
+        let service = state.0.registry.get(service_id);
+        log_span.record("service", service.name.as_str());
+        call.record("gateway.service", service.name.as_str());
+        let response = handle_systemone(&state.0, service_id, &body, arrived, &call).await;
+        record_call(&state.0.metrics, &service.name, response.status(), arrived);
+        response
+    }
+    .instrument(call.clone())
+    .await;
+    telemetry::finish_call(&call, response.status());
     response
 }
 
@@ -41,6 +57,7 @@ async fn handle_systemone(
     service_id: ServiceId,
     body: &[u8],
     arrived: Instant,
+    call: &Span,
 ) -> Response {
     let service = state.registry.get(service_id);
     let request = match PreparedRequest::parse(body, &state.estimator) {
@@ -65,6 +82,8 @@ async fn handle_systemone(
         ))
         .into_response();
     };
+    call.record("gateway.backend", backend.name.as_str());
+    call.record("gateway.model", request.model.as_str());
     if let Err(invalid) = backend.check(&request) {
         return GatewayError::invalid(invalid).into_response();
     }
@@ -113,6 +132,9 @@ async fn handle_systemone(
 
     match timeout_at(deadline, answer).await {
         Ok(Ok(outcome)) => {
+            if let Outcome::Answered { batch_callers, .. } = &outcome {
+                call.record("gateway.batch_callers", *batch_callers as u64);
+            }
             let mut response = outcome_response(state, &service.name, &backend.name, outcome);
             if let Ok(value) = HeaderValue::from_str(&backend.name) {
                 response.headers_mut().insert(BACKEND, value);

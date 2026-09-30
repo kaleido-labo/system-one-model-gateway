@@ -9,13 +9,14 @@ use axum::http::StatusCode;
 use bytes::Bytes;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::{Instant, sleep_until, timeout_at};
-use tracing::{debug, error, warn};
+use tracing::{Instrument, Span, debug, error, warn};
 
 use crate::backend::{Engine, UpstreamFailure, describe};
 use crate::error::GatewayError;
 use crate::metrics::Metrics;
 use crate::scheduling::batch::{Plan, SplitError};
 use crate::scheduling::limiter::Gcra;
+use crate::telemetry;
 use crate::wire::{PreparedRequest, input_tokens};
 
 /// Shortest retry-after the gateway suggests when it sheds a call.
@@ -33,6 +34,9 @@ pub struct Member {
     /// When the caller stops waiting for an answer.
     pub deadline: Instant,
     pub reply: oneshot::Sender<Outcome>,
+    /// The call's span in the trace, which a batch links to and hangs its
+    /// own span from. Not the log span: see `telemetry`.
+    pub span: Span,
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +136,11 @@ impl Dispatcher {
         }
     }
 
+    /// The backend's name.
+    pub fn backend(&self) -> &str {
+        &self.backend
+    }
+
     pub fn pacer(&self) -> &Gcra {
         &self.pacer
     }
@@ -149,12 +158,14 @@ impl Dispatcher {
     }
 
     /// Sends one sealed batch upstream and answers every caller in it.
-    /// `opened` is when the batch received its first call.
+    /// `opened` is when the batch received its first call, and `span` is the
+    /// batch's span in the trace.
     pub async fn dispatch(
         self: &Arc<Self>,
         members: Vec<Member>,
         permit: OwnedSemaphorePermit,
         opened: Instant,
+        span: Span,
     ) {
         // Callers who timed out or hung up are not worth paying for. Callers
         // whose latest send time passed were answered while the batch waited
@@ -220,11 +231,12 @@ impl Dispatcher {
             sleep_until(start).await;
         }
 
-        self.metrics.queue_wait.observe(
-            Instant::now()
-                .saturating_duration_since(opened)
-                .as_secs_f64(),
-        );
+        let queue_wait = Instant::now().saturating_duration_since(opened);
+        self.metrics.queue_wait.observe(queue_wait.as_secs_f64());
+        span.record("gateway.queue_wait_ms", queue_wait.as_millis() as u64);
+        span.record("gateway.batch.callers", plan.callers as u64);
+        span.record("gateway.batch.questions", plan.questions as u64);
+        span.record("gateway.batch.deduplicated", plan.deduplicated as u64);
         self.metrics.batch_callers.observe(plan.callers as f64);
         self.metrics.batch_questions.observe(plan.questions as f64);
         self.metrics
@@ -244,8 +256,16 @@ impl Dispatcher {
             .max()
             .expect("at least one live member");
         let sent = Instant::now();
-        let result = self.engine.execute(plan.body.clone(), deadline).await;
+        // The attempts are children of the batch span.
+        let result = self
+            .engine
+            .execute(plan.body.clone(), deadline)
+            .instrument(span.clone())
+            .await;
         drop(permit);
+        if result.is_err() {
+            span.record("otel.status_code", "ERROR");
+        }
 
         match result {
             Ok(reply) => {
@@ -341,6 +361,10 @@ impl Dispatcher {
             // The call was admitted already, so only its own deadline bounds
             // the wait for a slot and a connection.
             member.latest_send = member.deadline;
+            // The merged call's span is over: the replay is a child of its
+            // caller's own span.
+            let span = telemetry::batch(&member.span, &self.backend, &member.request.model);
+            span.record("gateway.batch.replay", true);
             let now = Instant::now();
             let start = self.pacer.book(now, 1);
             if start >= member.deadline {
@@ -359,7 +383,7 @@ impl Dispatcher {
                 self.pacer.adjust(-1);
                 return;
             };
-            self.dispatch(vec![member], permit, start).await;
+            self.dispatch(vec![member], permit, start, span).await;
         })
     }
 }

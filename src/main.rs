@@ -3,9 +3,13 @@ use std::path::PathBuf;
 
 use anyhow::ensure;
 use clap::{Parser, Subcommand};
-use systemone_gateway::{Config, Gateway, LogFormat, Protocol, generate_key, hash_key};
+use systemone_gateway::{
+    Config, Gateway, LogFormat, Protocol, Telemetry, generate_key, hash_key, logs_filter,
+};
 use tracing::info;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer, Registry};
 
 #[derive(Parser)]
 #[command(
@@ -54,11 +58,16 @@ async fn main() -> anyhow::Result<()> {
 
 async fn serve(path: PathBuf) -> anyhow::Result<()> {
     let config = Config::load(&path)?;
-    init_logging(config.server.log_format);
+    let telemetry = init_logging(&config)?;
     let gateway = Gateway::start(&config, |variable| std::env::var(variable).ok()).await?;
     shutdown_signal().await;
     info!("shutting down; letting in-flight calls finish");
-    gateway.shutdown().await
+    let stopped = gateway.shutdown().await;
+    // After the servers: the spans of the last calls are in the queue by now.
+    if let Some(telemetry) = telemetry {
+        telemetry.shutdown().await;
+    }
+    stopped
 }
 
 fn check_config(path: PathBuf) -> anyhow::Result<()> {
@@ -82,6 +91,16 @@ fn check_config(path: PathBuf) -> anyhow::Result<()> {
             backend.models.join(", "),
             backend.requests_per_minute,
         );
+    }
+    match config
+        .tracing
+        .endpoint(&|variable| std::env::var(variable).ok())
+    {
+        Some(endpoint) => println!(
+            "tracing: spans of service {} exported to {} (from {}), {} of the traces the gateway starts kept",
+            config.tracing.service_name, endpoint.url, endpoint.source, config.tracing.sample_ratio,
+        ),
+        None => println!("tracing: off"),
     }
     match config.coalescing.window_ms {
         0 => println!("merging: off"),
@@ -127,16 +146,41 @@ fn hash_stdin_key() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn init_logging(format: LogFormat) {
+/// Sets up logging and, when an OTLP endpoint is configured, trace export.
+/// Returns the exporter, to flush when the gateway stops.
+fn init_logging(config: &Config) -> anyhow::Result<Option<Telemetry>> {
+    let telemetry = config
+        .tracing
+        .endpoint(&|variable| std::env::var(variable).ok())
+        .map(|endpoint| {
+            Telemetry::otlp(&config.tracing, &endpoint).map(|telemetry| (telemetry, endpoint))
+        })
+        .transpose()?;
+
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     // Colours only on a terminal: in a container log they are noise.
-    let logs = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_ansi(std::io::stdout().is_terminal());
-    match format {
-        LogFormat::Json => logs.json().flatten_event(true).init(),
-        LogFormat::Text => logs.init(),
+    let logs = tracing_subscriber::fmt::layer().with_ansi(std::io::stdout().is_terminal());
+    let logs = match config.server.log_format {
+        LogFormat::Json => logs.json().flatten_event(true).boxed(),
+        LogFormat::Text => logs.boxed(),
+    };
+    Registry::default()
+        // The trace spans are for the tracing backend only: the log lines
+        // stay what they were.
+        .with(logs.with_filter(logs_filter(filter)))
+        .with(telemetry.as_ref().map(|(telemetry, _)| telemetry.layer()))
+        .init();
+
+    if let Some((_, endpoint)) = &telemetry {
+        info!(
+            url = %endpoint.url,
+            from = endpoint.source,
+            service_name = %config.tracing.service_name,
+            sample_ratio = config.tracing.sample_ratio,
+            "exporting traces"
+        );
     }
+    Ok(telemetry.map(|(telemetry, _)| telemetry))
 }
 
 async fn shutdown_signal() {

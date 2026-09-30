@@ -25,6 +25,8 @@
 //!   and splitting each answer and its token usage back between callers.
 //! - `error`: the errors the gateway answers itself, in TypeSafe's shape.
 //! - `metrics`: the Prometheus metrics served on the admin port.
+//! - `telemetry`: OpenTelemetry traces, exported when an OTLP endpoint is
+//!   configured.
 
 mod app;
 mod backend;
@@ -34,8 +36,10 @@ mod http;
 mod metrics;
 mod scheduling;
 mod services;
+mod telemetry;
 mod wire;
 
 pub use app::Gateway;
-pub use config::{Config, LogFormat, Protocol};
+pub use config::{Config, LogFormat, Protocol, TracesEndpoint, TracingConfig};
 pub use services::{generate_key, hash_key};
+pub use telemetry::{Telemetry, logs_filter};
