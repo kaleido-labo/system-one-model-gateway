@@ -4,6 +4,7 @@ Running, watching and tuning the gateway.
 
 - [Docker](#docker)
 - [Kubernetes](#kubernetes)
+- [Reloading the configuration](#reloading-the-configuration)
 - [Logs](#logs)
 - [Metrics](#metrics)
 - [Traces](#traces)
@@ -159,6 +160,118 @@ Hashing keeps a state on one replica while the set of replicas is stable.
 When replicas come and go, some states move, and a state that is asked about
 very often loads one replica more than the others.
 
+## Reloading the configuration
+
+Adding a service, rotating a key or changing a backend's limits does not need a
+restart. The gateway reads the file again, checks all of it, and switches to the
+new configuration between one call and the next. A file that is invalid changes
+nothing: the gateway keeps running on the configuration it has.
+
+### Triggering a reload
+
+- **`SIGHUP`** (Linux and macOS). The gateway re-reads the file it was started
+  with, which is the `--config` path, whether or not the content changed.
+
+  ```sh
+  kill -HUP "$(pidof systemone-gateway)"   # on a host
+  docker kill --signal=HUP gateway         # in Docker
+  ```
+
+  Under systemd, `ExecReload=/bin/kill -HUP $MAINPID` makes `systemctl reload`
+  work. The image has no shell and no `kill`, so `kubectl exec` cannot send the
+  signal: on Kubernetes use the polling below.
+- **Polling**, off by default. Set `server.config_reload_interval_ms` (at least
+  100) and the gateway looks at the file at that interval, and reloads it when
+  its content changed. It compares a hash of the content, not the modification
+  time, because Kubernetes swaps a symlink when it updates a ConfigMap and the
+  files keep their old times. A file that was looked at once is not looked at
+  again until its content changes, so a file that fails is reported once, not
+  every interval. Polling works on every platform. A reload can change the
+  interval itself.
+
+### On Kubernetes
+
+Mount the ConfigMap as a directory, or as a single file without `subPath`: the
+kubelet updates those, and does not update a `subPath` mount. Set the polling
+interval, for example `config_reload_interval_ms = 10000`, and edit the
+ConfigMap. The kubelet takes up to a minute or so to write the new file into the
+pod, and the gateway reloads within one interval after that. A new key hash, a
+quota or a backend limit then reaches every replica without a rollout. A new
+environment variable does not: the environment of a running pod cannot change
+(see the next section).
+
+### What a reload checks
+
+The same as `check-config`, plus what `serve` checks in the environment: the
+variable of a backend's key, of the admin token and of the Redis URL must be set
+and not empty. The environment is the one the process started with, so a file
+that adds a backend with an `api_key_env` that the pod does not have is refused.
+The Secret has to be added to the pod, which restarts it. If a check fails, the
+gateway logs `configuration reload failed; still running on the previous
+configuration` with the reason, counts it in
+`config_reloads_total{result="error"}`, and carries on. A reload never stops the
+gateway.
+
+Run `check-config` on the new file first when you can: it catches the same
+mistakes without touching the running gateway.
+
+### What is applied, and what needs a restart
+
+| Setting | On reload |
+| --- | --- |
+| `[[service]]`, all of it: keys, quotas, `allowed_models` | Applied. A service whose block is unchanged, `key_sha256` aside, keeps its rate limiter and its calls in flight, so rotating a key does not reset a quota. A service whose limits changed starts with a fresh limiter. |
+| `[[backend]]` | Applied. A backend whose block is unchanged, while `[coalescing]` is unchanged too, carries on as it is: its queue, pacing, circuit breaker and models list are kept. A new or changed backend is built fresh, with a closed breaker. A removed backend takes no new calls. |
+| `[coalescing]` | `window_ms`, `max_questions`, `max_request_tokens` and `max_state_plus_question_tokens` are part of every backend, so changing one builds every backend again. `bytes_per_token` is applied without that. |
+| `[cache]` | Kept, with its answers, when the table is unchanged. Any change, including turning it on or off, starts an empty cache. |
+| `server.request_timeout_ms` | Applied, to the calls that start after the reload. |
+| `server.config_reload_interval_ms` | Applied. |
+| `server.listen`, `server.admin_listen`, `server.max_body_bytes` | Restart. The ports are bound, and the body limit is set, once. |
+| `server.log_format` | Restart. Logging is set up once. |
+| `server.admin_token_env` | Restart. The token is read when the gateway starts. |
+| `[cluster]` | Restart. The Redis connection is made once. |
+| `[tracing]` | Restart. The exporter is set up once. |
+
+When a reload applies the file but some restart-only keys differ from what is
+running, it applies the rest and logs a `warn` for each such key:
+`changed in the configuration file, but it only takes effect after a restart`,
+with the `key`. The running value stays in force until the restart, so the file
+and the gateway disagree until then.
+
+### What happens to the calls in progress
+
+A call takes one snapshot of the configuration when it starts and uses it until
+it is answered, so it never sees half of the old file and half of the new one.
+A call that is queued, or in flight upstream, on a backend that the reload
+changes or removes is finished by that backend: nothing is dropped, and its
+answer is sent as usual. Only the calls that start after the reload use the new
+configuration. The old backend lives until its last call is done.
+
+What a rebuilt backend does not keep:
+
+- **Its queue.** Calls already queued stay on the old backend and new calls
+  queue on the new one, so for a moment the two do not merge with each other.
+- **Its pacing.** Without `[cluster]`, the new backend starts with a full
+  burst, so for a moment after the change the old and the new backend can
+  together send a little more than the limit. With `[cluster]`, the budget is
+  in Redis under the backend's name and carries on.
+- **Its circuit breaker**, which starts closed, and its models list cache.
+
+The answer cache is keyed by the request, not by the backend that answered, so
+changing a backend's `base_url` or model does not empty it. To empty the cache
+on purpose, change a `[cache]` value, or restart.
+
+### Watching a reload
+
+| Where | What |
+| --- | --- |
+| `config_reloads_total{result="ok"}` and `{result="error"}` | One per reload attempt, from `SIGHUP`, from polling, or from a file that could not be read. Both exist from the start, at 0. The start itself is not counted. |
+| `config_last_reload_timestamp_seconds` | Unix time of the last configuration loaded, the start included: how old the running configuration is. |
+| Logs | `configuration reloaded`, with how many services and which backends were kept, built and removed; `configuration reload failed` with the reason; one `warn` per restart-only key. |
+
+The counters and histograms of a service or backend that a reload removed stay
+in `/metrics`, as they do for any Prometheus counter. The gauges of a removed
+backend (`circuit_state`) go.
+
 ## Logs
 
 Logs go to standard output. `server.log_format = "json"` gives one JSON object
@@ -179,6 +292,10 @@ and timings.
 | --- | --- | --- |
 | info | `exporting traces` | Startup, only when [tracing](#traces) is on: the collector URL, where the setting came from, the service name and the sample ratio. |
 | info | `gateway listening` | Startup, with the addresses and the number of services and backends. |
+| info | `SIGHUP received; reloading the configuration`, `configuration file changed; reloading` | A [reload](#reloading-the-configuration) was triggered. |
+| info | `configuration reloaded` | A reload succeeded, with `services`, `backends_kept`, `backends_built` and `backends_removed`. |
+| warn | `changed in the configuration file, but it only takes effect after a restart` | A reload found a restart-only setting that differs from the running one. One line per setting, with its `key`. |
+| error | `configuration reload failed; still running on the previous configuration` | A reload was refused, with the `error`. The gateway carries on with the old configuration. |
 | info | `finished processing request` | Every call on the public port, with `method`, `path`, `request_id`, `service`, `status` and `latency`. `service` is missing when the call was refused before authentication. |
 | warn | `retrying the upstream call` | A retry, with `backend`, `attempt`, `delay_ms` and `failure`. |
 | warn | `upstream call failed` | A call failed after its retries. |
@@ -265,9 +382,19 @@ nothing went upstream.
 | --- | --- | --- |
 | `shared_limiter_errors_total` | counter | Bookings on the shared rate limiter that could not reach Redis within `redis_timeout_ms`, and were paced on this replica's own share instead. Stays at 0 without `[cluster]`. While it grows, the limits are not shared. After a failure, Redis is left alone for a second, so a long outage counts about one error a second per replica, not one per call. |
 
+### Configuration reloads
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `config_reloads_total` | counter | `result` | [Reload](#reloading-the-configuration) attempts: `ok`, or `error` when the file was invalid and the gateway kept the previous configuration. The start is not counted. |
+| `config_last_reload_timestamp_seconds` | gauge | | Unix time of the last configuration loaded successfully, at start or by a reload. |
+
 ### Useful queries
 
 ```promql
+# A reload that was refused in the last hour (alert on this after each rollout)
+increase(systemone_gateway_config_reloads_total{result="error"}[1h]) > 0
+
 # Share of calls answered with 429, per service
 sum by (service) (rate(systemone_gateway_calls_total{status="429"}[5m]))
   / sum by (service) (rate(systemone_gateway_calls_total[5m]))
@@ -504,6 +631,13 @@ SDK timeout (10 s by default, in the caller)
 - **Per process.** Merging, `max_concurrency` and each service's
   `max_concurrent` live in memory, and pacing does too unless you configure
   `[cluster]`. See [Kubernetes](#kubernetes) for running several replicas.
+- **A reload does not restart the process.** The listeners, the body limit, the
+  log format, the admin token, `[cluster]` and `[tracing]` need a restart, and so
+  does a new environment variable. See
+  [Reloading the configuration](#reloading-the-configuration). Also, a backend
+  that a reload rebuilds shares its `circuit_state` gauge, by name, with the one
+  it replaces, so a late result of a call still running on the old backend can
+  overwrite the gauge until the new breaker next changes state.
 - **Shared pacing is best effort.** It needs Redis 5 or later (or Valkey)
   as a single endpoint without TLS, and costs a round trip per booking. While Redis is unreachable,
   each replica paces on its own share (`expected_replicas`), and the bookings it

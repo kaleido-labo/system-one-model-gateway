@@ -24,6 +24,11 @@ being ignored. A backend's key variable, or the admin token's, that is unset or
 empty also stops `serve`, with a message naming the variable, and so does the
 Redis URL variable when `[cluster]` is configured.
 
+A running gateway reads the file again on `SIGHUP`, and optionally whenever its
+content changes (`server.config_reload_interval_ms`), and applies most of it
+without a restart. The tables below say, for each key, whether a reload applies
+it. See [Reloading the configuration](operations.md#reloading-the-configuration).
+
 Environment variables the gateway reads:
 
 | Variable | Used for |
@@ -62,18 +67,26 @@ refuses it with a message: rename it to `[[backend]]` and add
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `listen` | socket address | `0.0.0.0:8080` | Public API: `POST /v1/systemone` and `GET /v1/models`. |
-| `admin_listen` | socket address | `0.0.0.0:9090` | `/healthz`, `/readyz` and `/metrics`. Keep this port off the public network. |
-| `admin_token_env` | string | unset | Name of the environment variable that holds a bearer token for `/metrics`. Unset leaves `/metrics` open. When set, `/metrics` answers 401 unless the request carries `Authorization: Bearer <token>`. `/healthz` and `/readyz` never ask for it, because Kubernetes probes cannot easily send a header. An empty name is refused. |
-| `request_timeout_ms` | integer, > 0 | `9000` | Longest a call may take from arrival to answer, queueing included. Past it the caller gets a 504. The TypeSafe SDKs time out after 10 s by default, so the default stays under that: callers get the gateway's 504 instead of a client-side timeout that the SDK would retry blindly. |
-| `max_body_bytes` | integer, > 0 | `2097152` | Largest request body. Larger requests get a 413. |
-| `log_format` | `"text"` or `"json"` | `"text"` | Log line format. Use `"json"` in production. |
+| `listen` | socket address | `0.0.0.0:8080` | Public API: `POST /v1/systemone` and `GET /v1/models`. Needs a restart to change: the port is bound once. |
+| `admin_listen` | socket address | `0.0.0.0:9090` | `/healthz`, `/readyz` and `/metrics`. Keep this port off the public network. Needs a restart to change, like `listen`. |
+| `admin_token_env` | string | unset | Name of the environment variable that holds a bearer token for `/metrics`. Unset leaves `/metrics` open. When set, `/metrics` answers 401 unless the request carries `Authorization: Bearer <token>`. `/healthz` and `/readyz` never ask for it, because Kubernetes probes cannot easily send a header. An empty name is refused. Needs a restart to change: the token is read when the gateway starts. A reload still checks that the variable is set. |
+| `request_timeout_ms` | integer, > 0 | `9000` | Longest a call may take from arrival to answer, queueing included. Past it the caller gets a 504. The TypeSafe SDKs time out after 10 s by default, so the default stays under that: callers get the gateway's 504 instead of a client-side timeout that the SDK would retry blindly. Applied by a reload, to the calls that start after it. |
+| `max_body_bytes` | integer, > 0 | `2097152` | Largest request body. Larger requests get a 413. Needs a restart to change. |
+| `log_format` | `"text"` or `"json"` | `"text"` | Log line format. Use `"json"` in production. Needs a restart to change: logging is set up once. |
+| `config_reload_interval_ms` | integer, 0 or at least 100 | `0` | How often the gateway looks at the configuration file and reloads it when its content changed. `0` leaves reloading to `SIGHUP`. The content is compared, not the modification time, because a Kubernetes ConfigMap update swaps a symlink and keeps old times. Applied by a reload, so a reload can start or stop the polling. See [Reloading the configuration](operations.md#reloading-the-configuration). |
 
 ## `[[backend]]`
 
 One block per model provider. See [Backends](backends.md) for what each
 protocol does. Keys marked "chat only" or "System One only" are rejected on the
 other protocol, except where noted.
+
+A reload applies every key of a block. A backend whose block is unchanged keeps
+its queue, pacing and circuit breaker; one whose block changed, in any key, is
+built again and starts from scratch, and one that was removed takes no new
+calls. See [Reloading the configuration](operations.md#what-is-applied-and-what-needs-a-restart).
+A new backend can only name an `api_key_env` variable that the process already
+has.
 
 ### Identity and routing
 
@@ -170,6 +183,11 @@ These settings apply to every backend. `max_request_tokens` and
 sends one request per question, but it still forms batches under the same
 limits, so they cap the size of a batch there too.
 
+A reload applies all of them. `window_ms`, `max_questions`, `max_request_tokens`
+and `max_state_plus_question_tokens` are part of every backend's queue, so
+changing one builds every backend again, and each starts from scratch.
+`bytes_per_token` only sizes the estimate and is swapped without that.
+
 ## `[cache]`
 
 An in-memory cache of answers, off by default. It is one table for the whole
@@ -189,6 +207,9 @@ Answers are small (a few hundred bytes), so the default bound is a few
 megabytes. The cache lives in the process: a restart empties it, and with
 several replicas each one has its own. See [Architecture](architecture.md#answer-cache)
 for how a call uses it and [Operations](operations.md#metrics) for what to watch.
+
+A reload keeps the cache, with its answers, when this table is unchanged. Any
+change to it, including turning it on or off, starts an empty cache.
 
 ## `[tracing]`
 
@@ -216,6 +237,10 @@ The file has no key for headers, timeouts or compression. Use
 `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_TIMEOUT` and the like, which
 the exporter reads itself.
 
+The whole table needs a restart to change: the exporter and the logging
+subscriber are set up once for the process. A reload that changes it applies
+the rest of the file and logs a warning naming `[tracing]`.
+
 ## `[[service]]`
 
 One block per calling service. At least one is required.
@@ -237,6 +262,14 @@ With [`[cluster]`](#cluster), `requests_per_minute` is a limit of the whole
 cluster: a call that one replica admitted counts against the service on every
 replica. `max_concurrent` counts the calls in flight in this process, so each
 replica allows that many.
+
+A reload applies all of `[[service]]`: a new service can call at once, a removed
+one gets 401, and a key that was dropped stops working. A service whose block is
+unchanged, `key_sha256` aside, keeps what it has used of its rate and its calls
+in flight, so rotating keys never resets a quota. A service whose quota or
+`max_concurrent` changed gets fresh limits, so its quota starts again (with
+[`[cluster]`](#cluster) the rate budget is kept in Redis under the service's
+name and carries on).
 
 ## `[cluster]`
 
@@ -265,6 +298,11 @@ The gateway needs Redis 5 or later, or Valkey, as a single endpoint: Redis
 Cluster and Sentinel are not supported. It does not connect at startup,
 so a Redis that comes up after the gateway does not stop it from starting.
 
+The whole table needs a restart to change: the Redis connection is made once. A
+reload that changes it applies the rest of the file and logs a warning naming
+`[cluster]`. A reload does check that the variable named by `redis_url_env` still
+holds a usable URL.
+
 ```toml
 [cluster]
 redis_url_env = "REDIS_URL"
@@ -286,6 +324,7 @@ expected_replicas = 3
 - a rate, a timeout or a size that must be positive is zero, `cache.ttl_ms` and
   `cache.max_entries` included;
 - `server.admin_token_env` is an empty name;
+- `server.config_reload_interval_ms` is between 1 and 99;
 - `tracing.otlp_endpoint` is not an `http` or `https` URL, `tracing.service_name`
   is empty, or `tracing.sample_ratio` is outside 0 to 1;
 - a backend's `max_queue_wait_ms` is not smaller than `server.request_timeout_ms`;
@@ -299,4 +338,6 @@ expected_replicas = 3
   uses another character, or a zero `redis_timeout_ms` or `expected_replicas`.
 
 `serve` also refuses to start when the variable named by `cluster.redis_url_env`
-is empty, or holds something other than a `redis://` URL.
+is empty, or holds something other than a `redis://` URL. A reload makes the same
+checks on the environment, for the admin token, the Redis URL and the key of each
+backend it has to build, and keeps the running configuration when one fails.

@@ -47,6 +47,15 @@ request_timeout_ms = 9000
 max_body_bytes = 2097152
 # "text" for a terminal, "json" for log collectors. RUST_LOG sets the level.
 log_format = "text"
+# The gateway reloads this file on SIGHUP, without a restart: services,
+# backends, [coalescing], [cache] and request_timeout_ms are applied, and a file
+# that is invalid is refused while the gateway keeps running. listen,
+# admin_listen, max_body_bytes, log_format, admin_token_env, [cluster] and
+# [tracing] need a restart. To reload when the file's content changes (a
+# Kubernetes ConfigMap update, where the image cannot receive a signal), check
+# it every so many milliseconds; 0, the default, leaves it to SIGHUP. At least
+# 100 otherwise.
+# config_reload_interval_ms = 10000
 
 # ---------------------------------------------------------------------------
 # [[backend]]: where calls go, picked by the requested model

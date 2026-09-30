@@ -372,6 +372,24 @@ from the byte length of the minified JSON: `coalescing.bytes_per_token` bytes
 
 The default leans high, because a call that turns out too large is rejected.
 
+## Reloading
+
+The services, the backends, the answer cache and the request timeout belong to
+one snapshot that a handler reads once, when a call starts (step 1), and keeps
+until the call is answered. A reload builds the next snapshot on the side, after
+checking the whole file, and swaps it in with one assignment, so a call never
+sees half of the old configuration and half of the new one, and a failed reload
+leaves the current snapshot alone.
+
+The next snapshot reuses what did not change. A backend whose block is unchanged
+is the same object, with its queue (step 6), pacing (step 7) and circuit breaker
+(step 8); a service whose block is unchanged keeps its rate limiter. A backend
+that changed is built again, and the old one stays alive until the calls queued
+on it have their answers, because those calls hold it. Nothing in progress is
+dropped. See
+[Reloading the configuration](operations.md#reloading-the-configuration) for
+what a reload applies and what needs a restart.
+
 ## Shutdown
 
 On SIGTERM or SIGINT, the gateway marks itself not ready (`/readyz` answers
