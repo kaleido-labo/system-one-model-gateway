@@ -82,7 +82,10 @@ impl Aimd {
             "the decrease factor must be between 0 and 1"
         );
         assert!(params.step > 0.0, "the increase step must be positive");
-        assert!(!params.recovery.is_zero(), "the recovery time must be positive");
+        assert!(
+            !params.recovery.is_zero(),
+            "the recovery time must be positive"
+        );
         Self {
             params,
             state: Mutex::new(State {
@@ -223,7 +226,10 @@ mod tests {
         let aimd = rule(t0);
         aimd.on_rate_limited(t0);
         // Still inside the interval one tick before it ends...
-        assert_eq!(aimd.on_rate_limited(t0 + secs(10) - Duration::from_millis(1)), None);
+        assert_eq!(
+            aimd.on_rate_limited(t0 + secs(10) - Duration::from_millis(1)),
+            None
+        );
         // ...and a new episode when it is over: the lowered rate is still too high.
         assert_eq!(
             aimd.on_rate_limited(t0 + secs(10)),
