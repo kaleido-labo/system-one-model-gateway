@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.96"
 description = "One gateway in front of TypeSafe's System One API: absorbs calls from many services, merges the ones that share a state, and hands each caller back its own answers"
 readme = "README.md"
+license = "MIT"
 publish = false
 
 [dependencies]
