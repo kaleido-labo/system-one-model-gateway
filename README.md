@@ -89,19 +89,16 @@ cargo test                   # unit tests, and end-to-end tests against the mock
 cargo clippy --all-targets
 ```
 
-| Module | Role |
+| Path under `src/` | Role |
 | --- | --- |
-| `api` | HTTP handlers and routers |
-| `backend`, `pattern` | Backends, routing a model to one, model name patterns |
-| `chat` | The `chat` protocol: a prompt per question, answers read from logprobs |
-| `coalescer` | Opens, joins and seals batches |
-| `dispatch` | Sends a sealed batch, answers each caller, replays after a rejection |
-| `batch` | Builds the merged request and splits the answer |
-| `upstream` | HTTP client of one backend, retries, `retry-after` parsing |
-| `limiter` | GCRA pacing for requests, tokens and per-service quotas |
-| `protocol`, `json`, `validate` | Wire format kept as raw JSON, merge keys, documented rules |
-| `usage` | Largest-remainder split of token usage |
-| `services`, `config`, `metrics`, `error`, `app` | Keys and quotas, configuration, Prometheus, error shape, wiring |
+| `http/` | Routers, the `POST /v1/systemone` handler, `GET /v1/models`, admin endpoints |
+| `wire/` | The System One wire format kept as raw JSON: parsing, merge keys, documented request rules, token estimates |
+| `backend/` | Backends and model routing; the HTTP client of one backend with retries (`upstream/`); the `chat` protocol with a prompt per question and answers read from logprobs (`chat/`) |
+| `scheduling/` | Opens, joins and seals batches (`coalescer`); builds the merged request and splits the answer and token usage (`batch/`); sends a sealed batch and replays after a rejection (`dispatch`); GCRA pacing (`limiter`) |
+| `config/` | Configuration root and validation, backend settings, model name patterns |
+| `services.rs`, `metrics.rs`, `error.rs`, `app.rs` | Keys and quotas, Prometheus, error shape, wiring and shutdown |
+
+[CONTRIBUTING.md](CONTRIBUTING.md) covers the build, the lint commands and the pull request conventions.
 
 ## License
 
