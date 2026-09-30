@@ -169,7 +169,7 @@ async fn identical_questions_from_two_services_are_sent_once() {
     assert!(
         h.metrics()
             .await
-            .contains("systemone_gateway_deduplicated_questions_total 1")
+            .contains("systemone_gateway_deduplicated_questions_total{backend=\"typesafe\"} 1")
     );
 }
 
@@ -309,7 +309,7 @@ async fn a_rejected_merged_call_is_replayed_so_only_the_culprit_fails() {
     assert!(
         h.metrics()
             .await
-            .contains("systemone_gateway_isolated_replays_total 2")
+            .contains("systemone_gateway_isolated_replays_total{backend=\"typesafe\"} 2")
     );
 }
 
@@ -478,8 +478,11 @@ async fn metrics_account_per_service_and_per_upstream_call() {
         r#"systemone_gateway_questions_total{service="ocr"} 2"#,
         r#"systemone_gateway_questions_total{service="fraud"} 1"#,
         r#"systemone_gateway_upstream_calls_total{backend="typesafe",status="200"} 1"#,
-        "systemone_gateway_batch_callers_sum 2.0",
-        "systemone_gateway_batch_callers_count 1",
+        r#"systemone_gateway_batch_callers_sum{backend="typesafe"} 2.0"#,
+        r#"systemone_gateway_batch_callers_count{backend="typesafe"} 1"#,
+        r#"systemone_gateway_batch_questions_count{backend="typesafe"} 1"#,
+        r#"systemone_gateway_queue_wait_seconds_count{backend="typesafe"} 1"#,
+        r#"systemone_gateway_estimated_tokens_saved_total{backend="typesafe"}"#,
     ] {
         assert!(metrics.contains(line), "missing {line:?} in\n{metrics}");
     }

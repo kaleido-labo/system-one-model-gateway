@@ -222,20 +222,31 @@ impl Dispatcher {
             sleep_until(start).await;
         }
 
-        self.metrics.queue_wait.observe(
+        let backend = Metrics::backend(&self.backend);
+        self.metrics.queue_wait.get_or_create(&backend).observe(
             Instant::now()
                 .saturating_duration_since(opened)
                 .as_secs_f64(),
         );
-        self.metrics.batch_callers.observe(plan.callers as f64);
-        self.metrics.batch_questions.observe(plan.questions as f64);
+        self.metrics
+            .batch_callers
+            .get_or_create(&backend)
+            .observe(plan.callers as f64);
+        self.metrics
+            .batch_questions
+            .get_or_create(&backend)
+            .observe(plan.questions as f64);
         self.metrics
             .deduplicated_questions
+            .get_or_create(&backend)
             .inc_by(plan.deduplicated as u64);
         if self.engine.sends_state_once() {
-            self.metrics.estimated_tokens_saved.inc_by(u64::from(
-                plan.standalone_tokens.saturating_sub(plan.estimated_tokens),
-            ));
+            self.metrics
+                .estimated_tokens_saved
+                .get_or_create(&backend)
+                .inc_by(u64::from(
+                    plan.standalone_tokens.saturating_sub(plan.estimated_tokens),
+                ));
         }
 
         // Serve the most patient caller: callers whose deadline passes first
@@ -307,7 +318,10 @@ impl Dispatcher {
                     status = status.as_u16(),
                     "the backend rejected a merged call; replaying each call on its own"
                 );
-                self.metrics.isolated_replays.inc_by(live.len() as u64);
+                self.metrics
+                    .isolated_replays
+                    .get_or_create(&Metrics::backend(&self.backend))
+                    .inc_by(live.len() as u64);
                 for member in live {
                     tokio::spawn(Arc::clone(self).replay_alone(member));
                 }

@@ -172,6 +172,31 @@ async fn services_share_a_chat_batch_and_a_shared_question_is_asked_once() {
 }
 
 #[tokio::test]
+async fn merging_metrics_are_kept_per_backend() {
+    let h = Harness::start(chat_setup("")).await;
+    let jev = h
+        .call("key-ocr", call_body("jev-latest", json!({"q": noul("A?")})))
+        .await;
+    assert_eq!(jev.status, 200, "{}", jev.text);
+    let qwen = h
+        .call("key-ocr", call_body(QWEN, json!({"q": noul("A?")})))
+        .await;
+    assert_eq!(qwen.status, 200, "{}", qwen.text);
+    let metrics = h.metrics().await;
+    for backend in ["typesafe", "hf"] {
+        for name in ["batch_callers", "batch_questions", "queue_wait_seconds"] {
+            let line = format!(r#"systemone_gateway_{name}_count{{backend="{backend}"}} 1"#);
+            assert!(metrics.contains(&line), "missing {line:?} in\n{metrics}");
+        }
+    }
+    // A chat backend repeats the state for every question: no tokens saved.
+    assert!(
+        !metrics.contains(r#"estimated_tokens_saved_total{backend="hf"}"#),
+        "{metrics}"
+    );
+}
+
+#[tokio::test]
 async fn the_model_name_picks_the_backend() {
     let h = Harness::start(chat_setup("")).await;
     let jev = h
